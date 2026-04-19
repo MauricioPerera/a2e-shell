@@ -19,6 +19,7 @@ Environment variables, deployment modes, Dockerfile, and capability configuratio
 | `A2E_WORKER_ID` | random uuid | Stable id for this process. Emitted as `X-Worker-Id` on every response; load balancers MUST honor it for session affinity in multi-worker deployments |
 | `A2E_GRACE_PERIOD_MS` | `30000` | Max time to wait for in-flight requests before forcing exit on SIGTERM/SIGINT. Keep strictly below your orchestrator's kill timeout (e.g. Kubernetes `terminationGracePeriodSeconds`) |
 | `A2E_PID_FILE` | (unset) | If set, the node process writes its real PID here at startup. Use this (not shell `$!`) when the launch command includes env-var prefixes, which can fork an intermediate subshell |
+| `A2E_SESSION_PERSISTENCE` | `false` | **Experimental.** When `true`, sessions write state.json atomically on every mutation. Enables `POST /sessions/:id/resume` to rebuild state after process restarts. Binding values are stored inline — disk cost scales with active bindings |
 
 ### Credential redaction
 

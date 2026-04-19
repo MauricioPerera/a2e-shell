@@ -7,11 +7,12 @@ import * as path from "node:path";
 import type { ResolvedPolicy } from "../capabilities/policy.js";
 import type { Binding } from "../exec/interpolate.js";
 import type { Redactor } from "../credentials/redactor.js";
-import type { CatalogInfo, ExecResponse } from "../io/protocol.js";
+import type { CatalogInfo, CatalogSpec, ExecResponse } from "../io/protocol.js";
 import { A2EError } from "../errors.js";
 import { isReservedEnvKey } from "./validation.js";
 import { logger } from "../logging/logger.js";
 import { transcriptRotations } from "../metrics/metrics.js";
+import { writeState, type PersistedSession, PERSISTENCE_SCHEMA_VERSION } from "./persistence.js";
 import { openTranscript, type Transcript, type TranscriptEntry } from "./transcript.js";
 
 export interface SessionInit {
@@ -23,6 +24,18 @@ export interface SessionInit {
   readonly expires_at: Date;
   readonly transcript_path: string;
   readonly catalog: CatalogInfo | null;
+  /** Original catalog spec, stored so `POST /sessions/:id/resume` can verify
+   *  disk state still matches. Null when the session was created without a catalog. */
+  readonly catalog_spec?: CatalogSpec | null;
+  /** When true, every mutation schedules an atomic write of state.json. */
+  readonly persistenceEnabled?: boolean;
+  /** Optional pre-populated state from a resumed session. */
+  readonly restored?: {
+    readonly bindings: Record<string, Binding>;
+    readonly turn: number;
+    readonly history_size: number;
+    readonly transcript_bytes: number;
+  };
 }
 
 export interface SessionSnapshot {
@@ -67,6 +80,8 @@ export interface Session {
   readFullTranscript(): AsyncIterable<TranscriptEntry>;
   nextTurn(): number;
   snapshot(): SessionSnapshot;
+  /** Await any in-flight persistence write. No-op when persistence is off. */
+  flush(): Promise<void>;
 
   /** Returns a cached ExecResponse if the key was seen within TTL, else null. */
   idempotencyGet(key: string): ExecResponse | null;
@@ -91,13 +106,66 @@ const TRANSCRIPT_ROTATION_THRESHOLD = 0.8;
 export function createSession(init: SessionInit): Session {
   const env: Record<string, string> = { ...init.initial_env_overlay };
   const bindings = new Map<string, Binding>();
+  if (init.restored) {
+    for (const [k, v] of Object.entries(init.restored.bindings)) bindings.set(k, v);
+  }
   let transcript = openTranscript(init.transcript_path);
   const idempotencyCache = new Map<string, { response: ExecResponse; expires: number }>();
   const idempotencyInflight = new Map<string, Promise<ExecResponse>>();
   let cwd = init.initial_cwd;
-  let historySize = 0;
-  let turn = 0;
-  let transcriptBytes = 0;
+  let historySize = init.restored?.history_size ?? 0;
+  let turn = init.restored?.turn ?? 0;
+  let transcriptBytes = init.restored?.transcript_bytes ?? 0;
+
+  // --- Persistence orchestration ---------------------------------------------
+  const statePath = path.join(path.dirname(init.transcript_path), "state.json");
+  let persistDirty = false;
+  let persistFlush: Promise<void> | null = null;
+
+  function snapshotForPersistence(): PersistedSession {
+    const bindingsOut: Record<string, Binding> = {};
+    for (const [k, v] of bindings) bindingsOut[k] = v;
+    return {
+      schema_version: PERSISTENCE_SCHEMA_VERSION,
+      session_id: init.session_id,
+      cwd,
+      env_overlay: { ...env },
+      bindings: bindingsOut,
+      policy: init.policy,
+      catalog: init.catalog,
+      catalog_spec: init.catalog_spec ?? null,
+      expires_at: init.expires_at.toISOString(),
+      turn,
+      history_size: historySize,
+      transcript_bytes: transcriptBytes,
+    };
+  }
+
+  function markDirty(): void {
+    if (!init.persistenceEnabled) return;
+    persistDirty = true;
+    void runFlush();
+  }
+
+  async function runFlush(): Promise<void> {
+    if (persistFlush) return persistFlush;
+    persistFlush = (async () => {
+      while (persistDirty) {
+        persistDirty = false;
+        try {
+          await writeState(statePath, snapshotForPersistence());
+        } catch (e) {
+          logger.warn({
+            event: "session.persist.failed",
+            session_id: init.session_id,
+            err: String(e),
+          });
+        }
+      }
+      persistFlush = null;
+    })();
+    return persistFlush;
+  }
 
   async function rotateTranscript(): Promise<void> {
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -156,6 +224,7 @@ export function createSession(init: SessionInit): Session {
     getCwd: () => cwd,
     setCwd(abs: string) {
       cwd = abs;
+      markDirty();
     },
 
     getEnvOverlay: () => ({ ...env }),
@@ -170,6 +239,7 @@ export function createSession(init: SessionInit): Session {
         );
       }
       env[k] = v;
+      markDirty();
     },
     unsetEnv(keys) {
       for (const k of keys) {
@@ -181,6 +251,7 @@ export function createSession(init: SessionInit): Session {
         }
       }
       for (const k of keys) delete env[k];
+      markDirty();
     },
 
     getBindings: () => bindings,
@@ -206,6 +277,7 @@ export function createSession(init: SessionInit): Session {
         );
       }
       bindings.set(name, b);
+      markDirty();
     },
 
     async appendTranscript(entry) {
@@ -231,6 +303,7 @@ export function createSession(init: SessionInit): Session {
       await transcript.appendRaw(cleanLine);
       transcriptBytes += byteLen;
       historySize++;
+      markDirty();
     },
     readFullTranscript(): AsyncIterable<TranscriptEntry> {
       return {
@@ -246,7 +319,11 @@ export function createSession(init: SessionInit): Session {
 
     nextTurn() {
       turn++;
+      markDirty();
       return turn;
+    },
+    flush() {
+      return persistFlush ?? Promise.resolve();
     },
 
     snapshot(): SessionSnapshot {

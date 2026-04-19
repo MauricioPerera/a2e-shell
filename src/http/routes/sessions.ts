@@ -28,6 +28,22 @@ export function mountSessions(app: Hono<AppEnv>, manager: SessionManager): void 
     if (!ok) throw new A2EError("NOT_FOUND", `session '${id}' not found`, 404);
     return c.body(null, 204);
   });
+
+  // Experimental. Reconstructs an in-memory session from disk state.json.
+  // Returns the same shape as POST /sessions so clients can treat either
+  // endpoint identically after the fact.
+  app.post("/sessions/:id/resume", async (c) => {
+    const id = c.req.param("id");
+    const session = await manager.resume(id);
+    const body: CreateSessionResponse = {
+      session_id: session.id,
+      mode: session.policy.mode,
+      cwd: session.getCwd(),
+      expires_at: session.expiresAt.toISOString(),
+      catalog: session.catalog,
+    };
+    return c.json(body, 200);
+  });
 }
 
 async function readJsonBody(c: import("hono").Context): Promise<unknown> {

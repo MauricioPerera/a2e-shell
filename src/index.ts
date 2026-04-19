@@ -50,6 +50,7 @@ const manager = createManager({
   catalogBootstrapTimeoutMs: envInt("A2E_CATALOG_BOOTSTRAP_TIMEOUT_MS", 60_000),
   catalogCache,
   allowedCwdPrefixes: envList("A2E_ALLOWED_CWD_PREFIXES"),
+  persistenceEnabled: (process.env.A2E_SESSION_PERSISTENCE ?? "false") === "true",
 });
 
 setInterval(() => manager.sweepExpired(), 60_000).unref();

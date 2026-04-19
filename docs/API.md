@@ -15,6 +15,7 @@ Request-response over HTTP/1.1. `Content-Type: application/json` on all requests
 | PATCH | `/sessions/:id/env` | Set/unset env vars (validated). |
 | GET | `/sessions/:id/transcript` | Full JSONL transcript. |
 | POST | `/sessions/:id/replay` | Integrity hash of transcript responses. |
+| POST | `/sessions/:id/resume` | **Experimental.** Reconstruct an in-memory session from disk `state.json`. Requires `A2E_SESSION_PERSISTENCE=true`. |
 
 ## HTTP codes
 
@@ -276,6 +277,47 @@ Either `0` disables that limiter. Exceeded → `429 RATE_LIMITED`.
 - First call: executes, stores response in session's in-memory cache (TTL 5min, cap 128).
 - Subsequent call with same key within TTL: returns cached response with `idempotent_hit: true`.
 - Transcript records both the original turn and the hit (both append).
+
+## Session resumption (experimental)
+
+When `A2E_SESSION_PERSISTENCE=true` is set on the server, every session writes `<A2E_SESSIONS_DIR>/<id>/state.json` atomically on each mutation (cwd, env, bindings, turn counter). If the process restarts (graceful or hard), a client that remembered its `session_id` can reconstruct the in-memory session:
+
+```http
+POST /sessions/<id>/resume
+```
+
+### Response — `200 OK`
+
+Identical shape to `POST /sessions` (see above). Fields reflect the restored state, not a new session.
+
+### Failure modes
+
+| Condition | Response |
+|---|---|
+| Persistence disabled on the server | `400 NOT_IMPLEMENTED_V1` |
+| `state.json` missing on disk | `404 NOT_FOUND` |
+| Session already live in-memory | `409 CONFLICT` (delete the live one first, or route to the owning worker) |
+| Session expired before resume | `409 CONFLICT` |
+| Catalog paths referenced in state no longer exist on disk | `500 UPSTREAM_ERROR` |
+
+### What's preserved
+
+- `cwd` and env overlay
+- All bindings (values included)
+- Policy + catalog info + catalog spec
+- Turn counter and history size
+- `expires_at` (absolute, unchanged)
+
+### What's NOT preserved
+
+- Idempotency cache (TTL-bounded, short-lived anyway)
+- In-flight exec promises (any exec that was running at the moment of crash is lost — the LLM must reissue)
+- Transcript file — already on disk, survives independently
+
+### Known experimental limits
+
+- **Binding values inline**: state.json grows with total binding bytes (up to `max_total_binding_bytes`, default 50 MiB). v0.4 will split bindings into per-file storage with lazy load.
+- **No multi-worker ownership lock**: two workers racing to resume the same session will clobber each other's state. Pin session affinity via `X-Worker-Id` or deploy with a single worker until v0.4 adds explicit claim semantics.
 
 ## SSE streaming (opt-in)
 

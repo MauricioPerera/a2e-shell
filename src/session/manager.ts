@@ -6,10 +6,12 @@ import * as crypto from "node:crypto";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 import { resolvePolicy } from "../capabilities/policy.js";
 import { buildRedactor } from "../credentials/redactor.js";
 import { createSession, type Session } from "./state.js";
 import { validateEnvMap, validateCwd } from "./validation.js";
+import { readState } from "./persistence.js";
 import { A2EError } from "../errors.js";
 import { bootstrapCatalog } from "../catalog/bootstrap.js";
 import type { CatalogCache } from "../catalog/cache.js";
@@ -28,16 +30,25 @@ export interface ManagerConfig {
    * check (NOT recommended for production).
    */
   readonly allowedCwdPrefixes: readonly string[];
+  /**
+   * Experimental. When true, sessions write state.json atomically on every
+   * mutation so `POST /sessions/:id/resume` can rebuild them after a restart.
+   */
+  readonly persistenceEnabled: boolean;
 }
 
 export interface SessionManager {
   create(req: CreateSessionRequest): Promise<Session>;
+  /** Experimental. Reconstruct a session from disk state.json. */
+  resume(id: string): Promise<Session>;
   get(id: string): Session;
   delete(id: string): Promise<boolean>;
   list(): readonly string[];
   sweepExpired(now?: Date): number;
   /** Accessor so routes can read the same prefix policy as create(). */
   allowedCwdPrefixes(): readonly string[];
+  /** True if state.json writes are enabled. */
+  persistenceEnabled(): boolean;
 }
 
 export function createManager(cfg: ManagerConfig): SessionManager {
@@ -122,6 +133,8 @@ export function createManager(cfg: ManagerConfig): SessionManager {
         expires_at,
         transcript_path,
         catalog,
+        catalog_spec: req.catalog ?? null,
+        persistenceEnabled: cfg.persistenceEnabled,
       });
       sessions.set(id, session);
       sessionsActive.set(sessions.size);
@@ -132,6 +145,88 @@ export function createManager(cfg: ManagerConfig): SessionManager {
         mode: policy.mode,
         has_catalog: catalog !== null,
         expires_at: expires_at.toISOString(),
+      });
+      return session;
+    },
+
+    async resume(id) {
+      if (!cfg.persistenceEnabled) {
+        throw new A2EError(
+          "NOT_IMPLEMENTED_V1",
+          "session persistence is disabled (set A2E_SESSION_PERSISTENCE=true)",
+          400,
+        );
+      }
+      if (sessions.has(id)) {
+        throw new A2EError("CONFLICT", `session '${id}' is already live`, 409);
+      }
+      const statePath = path.join(cfg.sessionsDir, id, "state.json");
+      let state;
+      try {
+        state = await readState(statePath);
+      } catch (e) {
+        throw new A2EError(
+          "NOT_FOUND",
+          `session '${id}' has no resumable state: ${(e as Error).message}`,
+          404,
+        );
+      }
+      if (state.session_id !== id) {
+        throw new A2EError(
+          "UPSTREAM_ERROR",
+          `state.json session_id '${state.session_id}' doesn't match URL '${id}'`,
+          500,
+        );
+      }
+      const expiresAt = new Date(state.expires_at);
+      if (expiresAt.getTime() < Date.now()) {
+        throw new A2EError("CONFLICT", `session '${id}' has expired`, 409);
+      }
+      // Catalog sanity: if the session had one, verify the worktree paths
+      // still exist. If they don't, reject — operator decides whether to
+      // re-bootstrap via a fresh create.
+      if (state.catalog) {
+        if (!fs.existsSync(state.catalog.index_dir) || !fs.existsSync(state.catalog.content_dir)) {
+          throw new A2EError(
+            "UPSTREAM_ERROR",
+            `session '${id}' catalog worktree paths no longer exist; create a fresh session`,
+            500,
+          );
+        }
+      }
+      const redactKeys = [...cfg.redactEnvKeys];
+      if (state.catalog_spec?.auth?.type === "token") {
+        redactKeys.push(state.catalog_spec.auth.env_var);
+      }
+      const redactor = buildRedactor(redactKeys, process.env);
+      const transcript_path = path.join(cfg.sessionsDir, id, "transcript.jsonl");
+      const session = createSession({
+        session_id: id,
+        policy: state.policy,
+        initial_cwd: state.cwd,
+        initial_env_overlay: state.env_overlay,
+        redactor,
+        expires_at: expiresAt,
+        transcript_path,
+        catalog: state.catalog,
+        catalog_spec: state.catalog_spec,
+        persistenceEnabled: true,
+        restored: {
+          bindings: state.bindings,
+          turn: state.turn,
+          history_size: state.history_size,
+          transcript_bytes: state.transcript_bytes,
+        },
+      });
+      sessions.set(id, session);
+      sessionsActive.set(sessions.size);
+      sessionLifecycle.inc({ event: "resumed" });
+      logger.info({
+        event: "session.resumed",
+        session_id: id,
+        turn: state.turn,
+        bindings_count: Object.keys(state.bindings).length,
+        has_catalog: state.catalog !== null,
       });
       return session;
     },
@@ -188,6 +283,7 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       return n;
     },
     allowedCwdPrefixes: () => effectiveCwdPrefixes,
+    persistenceEnabled: () => cfg.persistenceEnabled,
   };
 }
 

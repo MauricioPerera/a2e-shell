@@ -11,6 +11,7 @@ function makeApp(opts?: {
   authTokens?: readonly string[];
   rateLimitPerMinute?: number;
   rateLimitCreatePerMinute?: number;
+  persistenceEnabled?: boolean;
 }) {
   const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), "http-"));
   const catalogCache = createCatalogCache({
@@ -22,6 +23,7 @@ function makeApp(opts?: {
     catalogBootstrapTimeoutMs: 30_000,
     catalogCache,
     allowedCwdPrefixes: [],
+    persistenceEnabled: opts?.persistenceEnabled ?? false,
   });
   const lifecycle = createLifecycle();
   const app = buildApp({
@@ -353,6 +355,105 @@ describe("HTTP server", () => {
     const text = await res.text();
     expect(text).toContain("event: done");
     expect(text).toContain("CAPABILITY_DENIED");
+  });
+
+  it("session persistence: resume on a fresh manager restores cwd + env + bindings", async () => {
+    // Share one sessionsDir between two makeApp() instances. The second
+    // simulates a process restart with the same disk state.
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), "http-persist-"));
+    cleanup = sessionsDir;
+
+    // Pre-create a custom cwd *inside* sessionsDir so the default prefix
+    // allowlist accepts it.
+    const customCwd = path.join(sessionsDir, "custom");
+    fs.mkdirSync(customCwd, { recursive: true });
+
+    function makeAppOnDir(dir: string) {
+      const catalogCache = createCatalogCache({
+        enabled: false, cacheDir: path.join(dir, ".cache"), refreshSeconds: 3600,
+        filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
+      });
+      const manager = createManager({
+        sessionsDir: dir, redactEnvKeys: [], catalogBootstrapTimeoutMs: 30_000,
+        catalogCache, allowedCwdPrefixes: [], persistenceEnabled: true,
+      });
+      const lifecycle = createLifecycle();
+      const app = buildApp({
+        manager, lifecycle,
+        config: {
+          port: 0, authTokens: [], maxRequestBytes: 1_048_576, redactEnvKeys: [],
+          rateLimitPerMinute: 0, rateLimitCreatePerMinute: 0, workerId: "tw",
+        },
+      });
+      return { app, manager };
+    }
+
+    // --- First manager: create, mutate, flush ---
+    const first = makeAppOnDir(sessionsDir);
+    const create = await postJson(first.app, "/sessions", {
+      capabilities: { binaries_allowlist: ["printf", "bash"] },
+    });
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    await postJson(first.app, `/sessions/${sid}/exec`, {
+      command: "printf 'captured value'",
+      bind_as: "v",
+    });
+    await first.app.request(`/sessions/${sid}/cwd`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cwd: customCwd }),
+    });
+
+    const liveBefore = first.manager.get(sid);
+    await liveBefore.flush();
+
+    // Verify state.json exists on disk.
+    const statePath = path.join(sessionsDir, sid, "state.json");
+    expect(fs.existsSync(statePath)).toBe(true);
+
+    // --- Second manager: resume ---
+    const second = makeAppOnDir(sessionsDir);
+    const resumeRes = await postJson(second.app, `/sessions/${sid}/resume`, {});
+    expect(resumeRes.status).toBe(200);
+    const resumeBody = (await resumeRes.json()) as { session_id: string; cwd: string };
+    expect(resumeBody.session_id).toBe(sid);
+    expect(resumeBody.cwd).toBe(path.resolve(customCwd));
+
+    // Binding survived.
+    const state = await second.app.request(`/sessions/${sid}/state`);
+    const ss = (await state.json()) as {
+      bindings: Record<string, { shape: string; size_bytes: number }>;
+    };
+    expect(ss.bindings.v).toBeDefined();
+
+    // Turn counter survived: next exec gets t=3 (turn 1 = printf, turn 2 = patch
+    // didn't increment because PATCH doesn't call nextTurn, just persisted).
+    // We only assert that exec works post-resume with the binding intact.
+    const reuse = await postJson(second.app, `/sessions/${sid}/exec`, {
+      command: "echo ${$v}",
+    });
+    expect(reuse.status).toBe(200);
+    const reuseBody = (await reuse.json()) as { preview: string };
+    expect(reuseBody.preview).toContain("captured value");
+  });
+
+  it("session persistence: POST /resume when disabled returns NOT_IMPLEMENTED_V1", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const r = await postJson(app, "/sessions/does-not-matter/resume", {});
+    expect(r.status).toBe(400);
+    const body = (await r.json()) as { error: string };
+    expect(body.error).toBe("NOT_IMPLEMENTED_V1");
+  });
+
+  it("session persistence: POST /resume on unknown session → 404", async () => {
+    const { app, sessionsDir } = makeApp({ persistenceEnabled: true });
+    cleanup = sessionsDir;
+    const r = await postJson(app, "/sessions/no-such-session-id/resume", {});
+    expect(r.status).toBe(404);
+    const body = (await r.json()) as { error: string };
+    expect(body.error).toBe("NOT_FOUND");
   });
 
   it("waitForDrain resolves once in-flight reaches 0", async () => {
