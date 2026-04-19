@@ -5,6 +5,16 @@ import * as path from "node:path";
 import { buildGitAuth } from "../../src/catalog/bootstrap.js";
 import { A2EError } from "../../src/errors.js";
 
+// buildGitAuth single-quotes any path with shell-special chars (incl. `\` on
+// Windows). Assertions must match either the bare path (POSIX tmpdirs) or the
+// quoted form (Windows tmpdirs).
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function maybeQuoted(s: string): RegExp {
+  return new RegExp(`'?${escapeRegex(s)}'?`);
+}
+
 const savedEnv: Record<string, string | undefined> = {};
 function setEnv(k: string, v: string | undefined): void {
   if (!(k in savedEnv)) savedEnv[k] = process.env[k];
@@ -60,7 +70,7 @@ describe("buildGitAuth", () => {
     const r = buildGitAuth({ type: "ssh_key", key_path_env_var: "MY_KEY_PATH" });
     expect(r.extraArgs).toEqual([]);
     expect(r.extraEnv.GIT_SSH_COMMAND).toBeDefined();
-    expect(r.extraEnv.GIT_SSH_COMMAND).toContain(`-i ${keyPath}`);
+    expect(r.extraEnv.GIT_SSH_COMMAND).toMatch(new RegExp(`-i ${maybeQuoted(keyPath).source}`));
     expect(r.extraEnv.GIT_SSH_COMMAND).toContain("StrictHostKeyChecking=accept-new");
     expect(r.extraEnv.GIT_SSH_COMMAND).toContain("IdentitiesOnly=yes");
     expect(r.extraEnv.GIT_SSH_COMMAND).toContain("BatchMode=yes");
@@ -78,7 +88,7 @@ describe("buildGitAuth", () => {
       key_path_env_var: "MY_KEY",
       known_hosts_env_var: "MY_KH",
     });
-    expect(r.extraEnv.GIT_SSH_COMMAND).toContain(`UserKnownHostsFile=${knownHosts}`);
+    expect(r.extraEnv.GIT_SSH_COMMAND).toMatch(new RegExp(`UserKnownHostsFile=${maybeQuoted(knownHosts).source}`));
     expect(r.extraEnv.GIT_SSH_COMMAND).toContain("StrictHostKeyChecking=yes");
     expect(r.extraEnv.GIT_SSH_COMMAND).not.toContain("accept-new");
   });

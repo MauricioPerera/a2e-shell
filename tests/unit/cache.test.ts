@@ -13,7 +13,9 @@ function sh(cmd: string, cwd?: string): string {
 function makeBareRepo(base: string): { url: string; sha: string } {
   const repoDir = path.join(base, "src.git");
   fs.mkdirSync(repoDir);
-  sh("git init -q -b main && git config user.name x && git config user.email x@y", repoDir);
+  // core.autocrlf=false keeps byte-exact line endings round-tripping through
+  // checkout on Windows CI / dev boxes where the git global default converts.
+  sh("git init -q -b main && git config core.autocrlf false && git config user.name x && git config user.email x@y", repoDir);
   fs.writeFileSync(path.join(repoDir, "a.txt"), "hello\n");
   sh("git add -A && git commit -q -m init", repoDir);
   const sha = sh("git rev-parse HEAD", repoDir);
@@ -126,7 +128,10 @@ describe("createCatalogCache (shared-mirror mode)", () => {
     expect(promisor).toBe("true");
 
     // Worktree still materializes the file (promisor fetches the blob on demand).
-    expect(fs.readFileSync(path.join(t, "a.txt"), "utf8")).toBe("hello\n");
+    // Normalize CRLF → LF because the user's global core.autocrlf may convert
+    // on checkout; the test only cares that the blob content round-tripped.
+    const got = fs.readFileSync(path.join(t, "a.txt"), "utf8").replace(/\r\n/g, "\n");
+    expect(got).toBe("hello\n");
   });
 
   it("sweep: evicts idle mirrors when total exceeds maxBytes", async () => {
