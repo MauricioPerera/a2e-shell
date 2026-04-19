@@ -135,7 +135,7 @@ What exists today:
   - `/sessions` cold-start p95 < 200ms (no catalog)
   - Catalog bootstrap (cache hit, shared mirror) p95 < 100ms
   - Catalog bootstrap (cold, small repo) p95 < 3s
-- Benchmark suite (`tests/benchmarks/`) runs in CI; regressions block merge.
+- Benchmark suite (`tests/benchmarks/http.bench.ts`) runs in CI; regressions block merge. Shipped in v1.0.0-rc.2.
 
 ### Deployment templates
 

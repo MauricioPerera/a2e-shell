@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (typecheck + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+
+  bench:
+    name: bench (perf SLO gate)
+    runs-on: ubuntu-latest
+    # Ubuntu runner has bash at /bin/bash natively and no concurrent workload,
+    # so p95 budgets in tests/benchmarks/http.bench.ts should hold comfortably.
+    # Keep samples high enough that random GC pauses don't push p95 over.
+    env:
+      A2E_BENCH_SAMPLES: "1000"
+      A2E_BENCH_WARMUP: "100"
+      A2E_LOG_LEVEL: "warn"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run bench:http
+        env:
+          A2E_BENCH_JSON_OUT: bench-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench-results.json
+          retention-days: 30

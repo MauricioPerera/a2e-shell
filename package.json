@@ -1,6 +1,6 @@
 {
   "name": "a2e-shell",
-  "version": "1.0.0-rc.1",
+  "version": "1.0.0-rc.2",
   "private": true,
   "type": "module",
   "description": "HTTP server exposing a real OS shell as a primitive tool for LLM agents.",
@@ -17,7 +17,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:golden": "vitest run tests/golden.test.ts",
-    "bench:tokens": "tsx tests/benchmarks/tokens.ts"
+    "bench:tokens": "tsx tests/benchmarks/tokens.ts",
+    "bench:http": "tsx tests/benchmarks/http.bench.ts"
   },
   "dependencies": {
     "hono": "^4.6.0",

@@ -6,6 +6,18 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.0.0-rc.2] - 2026-04-19
+
+### Added
+- Performance SLO benchmark harness: [tests/benchmarks/http.bench.ts](tests/benchmarks/http.bench.ts) drives the Hono app in-process and asserts p95 latencies against budgets (`GET /healthz` ≤ 10ms, `POST /sessions` ≤ 200ms, `/exec` intercept ≤ 50ms, `/exec` subprocess ≤ 300ms). All budgets env-overridable.
+- CI workflow [.github/workflows/ci.yml](.github/workflows/ci.yml): `verify` (typecheck + tests) and `bench` (SLO gate, uploads JSON artifact). Regressions fail the PR.
+- `npm run bench:http` script.
+
+### Changed
+- Knocks one of the two items off the v1.0.0-final blocker list (perf SLO benchmarks). External security audit remains out-of-band.
+
+---
+
 ## [1.0.0-rc.1] - 2026-04-19
 
 First release candidate for the v1.0 stability promise. Every HTTP route, error code, request/response shape, env var name, and response header listed in [docs/API.md](docs/API.md) and [docs/OPERATIONS.md](docs/OPERATIONS.md) is now a **stable contract**. Additive changes (new fields / codes / vars) ship as minors; anything breaking ships under `/v2/*`.
@@ -97,6 +109,7 @@ Initial release. HTTP server exposing a real OS shell as a primitive tool for LL
 - Transcript as append-only audit log. Replay endpoint computing an integrity hash.
 - Default capability surface via Dockerfile: `curl`, `jq`, `gh`, `aws-cli`, `kubectl`, `git`, `grep`, `sed`, `gawk`, `ripgrep`.
 
+[1.0.0-rc.2]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.1
 [0.3.0]: https://github.com/MauricioPerera/a2e-shell/compare/0a4b85a...0f6aae3
 [0.2.0]: https://github.com/MauricioPerera/a2e-shell/compare/28af4c1...efea548
