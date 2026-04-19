@@ -142,13 +142,38 @@ describe("MCP gateway (RFC 001 v1.1)", () => {
     ],
   };
 
+  const resourceList = {
+    resources: [
+      {
+        uri: "catalog://docs/example",
+        name: "example",
+        description: "an example doc",
+        mimeType: "text/markdown",
+      },
+    ],
+  };
+
+  const promptList = {
+    prompts: [
+      {
+        name: "greet",
+        description: "greet the user",
+        arguments: [{ name: "name", description: "who to greet", required: true }],
+      },
+    ],
+  };
+
   beforeAll(async () => {
     mock = await startMockMcp((method, params) => {
       if (method === "initialize") {
         return {
           protocolVersion: "2025-06-18",
           serverInfo: { name: "mock-mcp", version: "0.1" },
-          capabilities: { tools: { listChanged: false } },
+          capabilities: {
+            tools: { listChanged: false },
+            resources: { listChanged: false, subscribe: false },
+            prompts: { listChanged: false },
+          },
         };
       }
       if (method === "tools/list") return toolList;
@@ -159,6 +184,32 @@ describe("MCP gateway (RFC 001 v1.1)", () => {
           isError: false,
         };
       }
+      if (method === "resources/list") return resourceList;
+      if (method === "resources/read") {
+        const p = params as { uri: string };
+        return {
+          contents: [
+            {
+              uri: p.uri,
+              mimeType: "text/markdown",
+              text: `# Example doc\n\nRequested: ${p.uri}`,
+            },
+          ],
+        };
+      }
+      if (method === "prompts/list") return promptList;
+      if (method === "prompts/get") {
+        const p = params as { name: string; arguments: { name: string } };
+        return {
+          description: "greet the user",
+          messages: [
+            {
+              role: "user",
+              content: { type: "text", text: `Hola ${p.arguments.name}` },
+            },
+          ],
+        };
+      }
       throw new Error(`unhandled method: ${method}`);
     });
   });
@@ -167,7 +218,7 @@ describe("MCP gateway (RFC 001 v1.1)", () => {
     if (mock) await mock.close();
   });
 
-  it("session create with mcp_servers connects + handshakes + caches tools", async () => {
+  it("session create with mcp_servers connects + handshakes + caches all primitives", async () => {
     const { app } = makeApp();
     const r = await app.request("/sessions", {
       method: "POST",
@@ -178,17 +229,27 @@ describe("MCP gateway (RFC 001 v1.1)", () => {
     });
     expect(r.status).toBe(201);
     const body = (await r.json()) as {
-      mcp_servers: Array<{ id: string; tools_count: number; protocol_version: string }>;
+      mcp_servers: Array<{
+        id: string;
+        tools_count: number;
+        resources_count: number;
+        prompts_count: number;
+        protocol_version: string;
+      }>;
     };
     expect(body.mcp_servers).toHaveLength(1);
     expect(body.mcp_servers[0]!.id).toBe("mock");
     expect(body.mcp_servers[0]!.tools_count).toBe(1);
+    expect(body.mcp_servers[0]!.resources_count).toBe(1);
+    expect(body.mcp_servers[0]!.prompts_count).toBe(1);
     expect(body.mcp_servers[0]!.protocol_version).toBe("2025-06-18");
 
     const methods = mock.calls.map((c) => c.method);
     expect(methods).toContain("initialize");
     expect(methods).toContain("notifications/initialized");
     expect(methods).toContain("tools/list");
+    expect(methods).toContain("resources/list");
+    expect(methods).toContain("prompts/list");
   });
 
   it("exec /bin/mcp-invoke routes to the MCP server and wraps in canonical response", async () => {
@@ -238,6 +299,86 @@ describe("MCP gateway (RFC 001 v1.1)", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ command: '/bin/mcp-invoke unknown tool {}' }),
+    });
+    expect(execR.status).toBe(200);
+    const body = (await execR.json()) as { error?: { code: string } };
+    expect(body.error?.code).toBe("MCP_TOOL_NOT_FOUND");
+  });
+
+  it("exec /bin/mcp-read fetches a resource and wraps in canonical response", async () => {
+    const { app } = makeApp();
+    const create = await app.request("/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mcp_servers: [{ id: "mock", url: mock.url }] }),
+    });
+    const { session_id } = (await create.json()) as { session_id: string };
+
+    const execR = await app.request(`/sessions/${session_id}/exec`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        command: "/bin/mcp-read mock catalog://docs/example",
+        bind_as: "doc",
+      }),
+    });
+    expect(execR.status).toBe(200);
+    const body = (await execR.json()) as {
+      status_line: string;
+      preview: unknown;
+      binding: string | null;
+      error?: unknown;
+    };
+    expect(body.error).toBeUndefined();
+    expect(body.status_line).toBe("[exit 0]");
+    expect(body.binding).toBe("$doc");
+    expect(String(body.preview)).toContain("Example doc");
+    expect(String(body.preview)).toContain("catalog://docs/example");
+  });
+
+  it("exec /bin/mcp-prompt renders the prompt and wraps as JSON", async () => {
+    const { app } = makeApp();
+    const create = await app.request("/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mcp_servers: [{ id: "mock", url: mock.url }] }),
+    });
+    const { session_id } = (await create.json()) as { session_id: string };
+
+    const execR = await app.request(`/sessions/${session_id}/exec`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        command: '/bin/mcp-prompt mock greet {"name":"Mauricio"}',
+      }),
+    });
+    expect(execR.status).toBe(200);
+    const body = (await execR.json()) as {
+      status_line: string;
+      shape: string | null;
+      preview: unknown;
+      error?: unknown;
+    };
+    expect(body.error).toBeUndefined();
+    expect(body.status_line).toBe("[exit 0]");
+    // prompts/get response serializes to JSON -> shape detects as Object
+    expect(body.shape).toMatch(/^json<Object>/);
+    expect(JSON.stringify(body.preview)).toContain("Hola Mauricio");
+  });
+
+  it("exec /bin/mcp-prompt with unknown prompt returns MCP_TOOL_NOT_FOUND", async () => {
+    const { app } = makeApp();
+    const create = await app.request("/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mcp_servers: [{ id: "mock", url: mock.url }] }),
+    });
+    const { session_id } = (await create.json()) as { session_id: string };
+
+    const execR = await app.request(`/sessions/${session_id}/exec`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "/bin/mcp-prompt mock does_not_exist {}" }),
     });
     expect(execR.status).toBe(200);
     const body = (await execR.json()) as { error?: { code: string } };

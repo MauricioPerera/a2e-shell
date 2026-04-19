@@ -1,18 +1,21 @@
 import { describe, it, expect } from "vitest";
-import { isMcpInvoke, parseInvoke } from "../../src/mcp/invoke.js";
+import { isMcpInvoke, parseInvoke, parseRead, parsePrompt } from "../../src/mcp/invoke.js";
 
 describe("isMcpInvoke", () => {
-  it("matches bare prefix", () => {
+  it("matches all three MCP verbs", () => {
     expect(isMcpInvoke("/bin/mcp-invoke")).toBe(true);
-  });
-  it("matches prefix + space", () => {
     expect(isMcpInvoke("/bin/mcp-invoke gh create_issue {}")).toBe(true);
+    expect(isMcpInvoke("/bin/mcp-read gh catalog://docs/foo")).toBe(true);
+    expect(isMcpInvoke("/bin/mcp-prompt gh greet {}")).toBe(true);
   });
   it("ignores leading whitespace", () => {
     expect(isMcpInvoke("   /bin/mcp-invoke gh a {}")).toBe(true);
+    expect(isMcpInvoke("   /bin/mcp-read gh x://y")).toBe(true);
   });
   it("rejects similar-but-different paths", () => {
     expect(isMcpInvoke("/bin/mcp-invoker foo")).toBe(false);
+    expect(isMcpInvoke("/bin/mcp-reader foo")).toBe(false);
+    expect(isMcpInvoke("/bin/mcp-prompts foo")).toBe(false);
     expect(isMcpInvoke("/bin/mcp foo")).toBe(false);
     expect(isMcpInvoke("mcp-invoke gh a {}")).toBe(false);
   });
@@ -68,5 +71,46 @@ describe("parseInvoke", () => {
     const r = parseInvoke("  /bin/mcp-invoke gh a {}");
     expect(r.server).toBe("gh");
     expect(r.tool).toBe("a");
+  });
+});
+
+describe("parseRead", () => {
+  it("parses server + uri", () => {
+    const r = parseRead("/bin/mcp-read gh catalog://docs/example-api");
+    expect(r.server).toBe("gh");
+    expect(r.uri).toBe("catalog://docs/example-api");
+  });
+  it("accepts file:// URIs", () => {
+    const r = parseRead("/bin/mcp-read fs file:///tmp/foo.txt");
+    expect(r.uri).toBe("file:///tmp/foo.txt");
+  });
+  it("accepts URIs with query strings", () => {
+    const r = parseRead("/bin/mcp-read api https://x.com/r?id=1&foo=bar");
+    expect(r.uri).toBe("https://x.com/r?id=1&foo=bar");
+  });
+  it("rejects missing uri", () => {
+    expect(() => parseRead("/bin/mcp-read gh")).toThrow(/missing resource uri/);
+  });
+  it("rejects obvious non-URIs", () => {
+    expect(() => parseRead("/bin/mcp-read gh plainword")).toThrow(/does not look like/);
+  });
+});
+
+describe("parsePrompt", () => {
+  it("parses server + name + args", () => {
+    const r = parsePrompt('/bin/mcp-prompt gh greet {"name":"world"}');
+    expect(r.server).toBe("gh");
+    expect(r.name).toBe("greet");
+    expect(r.args).toEqual({ name: "world" });
+  });
+  it("allows empty args", () => {
+    const r = parsePrompt("/bin/mcp-prompt gh greet");
+    expect(r.args).toEqual({});
+  });
+  it("rejects missing name", () => {
+    expect(() => parsePrompt("/bin/mcp-prompt gh")).toThrow(/missing prompt name/);
+  });
+  it("rejects non-object args", () => {
+    expect(() => parsePrompt('/bin/mcp-prompt gh greet [1,2]')).toThrow(/JSON object/);
   });
 });

@@ -25,7 +25,11 @@ import type {
   JsonRpcRequest,
   JsonRpcResponse,
   McpCallToolResult,
+  McpGetPromptResult,
   McpInitializeResult,
+  McpPrompt,
+  McpResource,
+  McpResourceContents,
   McpServerState,
   McpTool,
 } from "./types.js";
@@ -37,6 +41,8 @@ const CLIENT_VERSION = "1.1.0-rc.1";
 export interface McpClient {
   readonly state: McpServerState;
   callTool(name: string, args: Record<string, unknown>): Promise<McpCallToolResult>;
+  readResource(uri: string): Promise<readonly McpResourceContents[]>;
+  getPrompt(name: string, args: Record<string, unknown>): Promise<McpGetPromptResult>;
   close(): void;
 }
 
@@ -188,11 +194,38 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     }
   }
 
+  // --- resources/list (rc.2) ---------------------------------------------
+  // Servers that don't expose resources respond with -32601 Method Not Found.
+  // We treat that as "empty resources" and continue, matching the MCP spec's
+  // capability-negotiation posture.
+  const resources = new Map<string, McpResource>();
+  try {
+    const resp = await rpc<{ resources?: readonly McpResource[] }>("resources/list");
+    for (const r of resp.resources ?? []) {
+      if (typeof r.uri === "string") resources.set(r.uri, r);
+    }
+  } catch (e) {
+    if (!isMethodNotFound(e)) throw e;
+  }
+
+  // --- prompts/list (rc.2) -----------------------------------------------
+  const prompts = new Map<string, McpPrompt>();
+  try {
+    const resp = await rpc<{ prompts?: readonly McpPrompt[] }>("prompts/list");
+    for (const p of resp.prompts ?? []) {
+      if (typeof p.name === "string") prompts.set(p.name, p);
+    }
+  } catch (e) {
+    if (!isMethodNotFound(e)) throw e;
+  }
+
   const state: McpServerState = {
     id: spec.id,
     url: spec.url,
     protocolVersion: initResult.protocolVersion,
     tools,
+    resources,
+    prompts,
   };
 
   logger.info({
@@ -200,6 +233,8 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     server_id: spec.id,
     protocol_version: state.protocolVersion,
     tools_count: tools.size,
+    resources_count: resources.size,
+    prompts_count: prompts.size,
   });
 
   return {
@@ -223,11 +258,54 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       }
       return result;
     },
+    async readResource(uri) {
+      const result = await rpc<{ contents?: readonly McpResourceContents[] }>(
+        "resources/read",
+        { uri },
+      );
+      if (!result.contents || !Array.isArray(result.contents)) {
+        throw new A2EError(
+          "MCP_PROTOCOL_ERROR",
+          `mcp '${spec.id}' resources/read '${uri}': missing contents array`,
+        );
+      }
+      return result.contents;
+    },
+    async getPrompt(name, args) {
+      if (!prompts.has(name)) {
+        throw new A2EError(
+          "MCP_TOOL_NOT_FOUND",
+          `mcp '${spec.id}' has no prompt '${name}'`,
+        );
+      }
+      const result = await rpc<McpGetPromptResult>("prompts/get", {
+        name,
+        arguments: args,
+      });
+      if (!result.messages || !Array.isArray(result.messages)) {
+        throw new A2EError(
+          "MCP_PROTOCOL_ERROR",
+          `mcp '${spec.id}' prompts/get '${name}': missing messages array`,
+        );
+      }
+      return result;
+    },
     close() {
       // No persistent connection in HTTP transport. Placeholder for
       // symmetry with future SSE/stdio clients.
     },
   };
+}
+
+/**
+ * MCP spec: servers MAY return -32601 Method Not Found for capabilities they
+ * don't implement. Our rpc() wraps JSON-RPC errors as MCP_PROTOCOL_ERROR
+ * messages that include the numeric code — we sniff for "-32601" to drop the
+ * optional capability silently while letting real protocol errors bubble.
+ */
+function isMethodNotFound(e: unknown): boolean {
+  if (!(e instanceof A2EError)) return false;
+  return e.code === "MCP_PROTOCOL_ERROR" && /error\s+-?32601/i.test(e.message);
 }
 
 // --- helpers ----------------------------------------------------------------

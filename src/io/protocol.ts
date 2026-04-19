@@ -104,6 +104,9 @@ export const McpServerInfo = z
     url: z.string(),
     protocol_version: z.string(),
     tools_count: z.number().int().nonnegative(),
+    // rc.2 additions
+    resources_count: z.number().int().nonnegative().default(0),
+    prompts_count: z.number().int().nonnegative().default(0),
     server_info: z
       .object({
         name: z.string().optional(),

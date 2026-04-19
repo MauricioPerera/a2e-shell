@@ -45,6 +45,8 @@ function buildCreateResponse(session: Session): CreateSessionResponse {
       url: client.state.url,
       protocol_version: client.state.protocolVersion,
       tools_count: client.state.tools.size,
+      resources_count: client.state.resources.size,
+      prompts_count: client.state.prompts.size,
       server_info: null,
     });
   }

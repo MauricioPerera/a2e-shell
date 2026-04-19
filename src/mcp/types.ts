@@ -91,6 +91,53 @@ export interface McpInitializeResult {
   readonly capabilities?: Record<string, unknown>;
 }
 
+// --- MCP resources (rc.2) ---------------------------------------------------
+
+export interface McpResource {
+  readonly uri: string;
+  readonly name?: string;
+  readonly description?: string;
+  readonly mimeType?: string;
+}
+
+export interface McpResourceContentsText {
+  readonly uri: string;
+  readonly mimeType?: string;
+  readonly text: string;
+}
+
+export interface McpResourceContentsBlob {
+  readonly uri: string;
+  readonly mimeType?: string;
+  readonly blob: string; // base64
+}
+
+export type McpResourceContents = McpResourceContentsText | McpResourceContentsBlob;
+
+// --- MCP prompts (rc.2) -----------------------------------------------------
+
+export interface McpPromptArgumentSchema {
+  readonly name: string;
+  readonly description?: string;
+  readonly required?: boolean;
+}
+
+export interface McpPrompt {
+  readonly name: string;
+  readonly description?: string;
+  readonly arguments?: readonly McpPromptArgumentSchema[];
+}
+
+export interface McpPromptMessage {
+  readonly role: "user" | "assistant";
+  readonly content: { readonly type: "text"; readonly text: string };
+}
+
+export interface McpGetPromptResult {
+  readonly description?: string;
+  readonly messages: readonly McpPromptMessage[];
+}
+
 // Client-side representation of a connected server.
 export interface McpServerState {
   readonly id: string;
@@ -98,4 +145,6 @@ export interface McpServerState {
   readonly sessionId?: string;
   readonly protocolVersion: string;
   readonly tools: ReadonlyMap<string, McpTool>;
+  readonly resources: ReadonlyMap<string, McpResource>; // keyed by uri
+  readonly prompts: ReadonlyMap<string, McpPrompt>;
 }

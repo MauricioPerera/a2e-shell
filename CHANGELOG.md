@@ -6,6 +6,45 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.1.0-rc.2] - 2026-04-19
+
+Second release candidate for v1.1. Adds `resources/*` and `prompts/*` MCP primitives to the gateway. `tools/*` surface from rc.1 unchanged.
+
+### Added
+
+- **`resources/list` + `resources/read`**: the MCP handshake now also caches the server's resource catalog. Read content on-demand via the virtual `/bin/mcp-read <server> <uri>` exec command. Canonical response wraps text content as preview; blob content (base64) is surfaced as metadata only (`uri`, `mimeType`, `blob_bytes`) so the preview stays token-light.
+- **`prompts/list` + `prompts/get`**: prompt catalog cached at handshake. Render templates via `/bin/mcp-prompt <server> <name> <args-json>`. Result is serialized as JSON (`{description, messages[]}`) so the agent can `jq` into specific fields.
+- **New virtual commands**:
+  - `/bin/mcp-read <server> <uri>` — resources/read
+  - `/bin/mcp-prompt <server> <name> <args-json>` — prompts/get
+  - `/bin/mcp-invoke` from rc.1 unchanged
+- **Reachability report structure**: `buildMcpReachability` now produces a structured `{tools, resources, prompts, summary}` object instead of a flat tool map. Written to `<catalog>/index/mcp-tools.json` when a catalog is mounted. Each primitive gets its own keyed bucket so the agent can query by kind.
+- **Graceful capability probing**: if a server responds to `resources/list` or `prompts/list` with JSON-RPC `-32601 Method Not Found`, a2e-shell treats it as "no primitives of that kind" and continues (rather than failing session creation). Matches MCP spec capability-negotiation posture.
+- **`McpServerInfo` response shape**: now includes `resources_count` and `prompts_count` alongside `tools_count`.
+
+### Changed
+
+- `McpServerState` (internal) gained `resources: Map<uri, McpResource>` and `prompts: Map<name, McpPrompt>` alongside `tools`. Session.mcpClients API unchanged.
+- `buildMcpReachability` return type evolved. Callers accessing the flat tool map directly would need updating (none known inside the repo).
+
+### Deferred to rc.3
+
+- SSE transport (required for progress notifications on long-running tools)
+- Progress notification relay via SSE exec streaming
+- stdio transport
+- `resources/subscribe` + live cache invalidation
+- Multi-server load testing + benchmarks vs Claude Desktop
+
+### Backwards compatibility
+
+Fully additive. rc.1 sessions and clients work identically. The new `/bin/mcp-read` and `/bin/mcp-prompt` commands only activate when the agent emits them.
+
+### Tests
+
+30 MCP-specific tests pass; full suite 171/171 green (up from 160 in rc.1). Mock MCP server fixture extended to serve all three primitives.
+
+---
+
 ## [1.1.0-rc.1] - 2026-04-19
 
 First release candidate for v1.1 — MCP gateway (inbound). Implements [RFC 001](docs/rfcs/001-mcp-gateway.md) rc.1 scope.
@@ -153,6 +192,7 @@ Initial release. HTTP server exposing a real OS shell as a primitive tool for LL
 - Transcript as append-only audit log. Replay endpoint computing an integrity hash.
 - Default capability surface via Dockerfile: `curl`, `jq`, `gh`, `aws-cli`, `kubectl`, `git`, `grep`, `sed`, `gawk`, `ripgrep`.
 
+[1.1.0-rc.2]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.2
 [1.1.0-rc.1]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.1
 [1.0.0-rc.3]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.2
