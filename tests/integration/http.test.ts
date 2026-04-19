@@ -265,6 +265,18 @@ describe("HTTP server", () => {
     expect(create.headers.get("X-Worker-Id")).toBe("test-worker");
   });
 
+  it("every response carries X-API-Version", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const r = await app.request("/healthz");
+    expect(r.headers.get("X-API-Version")).toBe("1");
+    const create = await postJson(app, "/sessions", {});
+    expect(create.headers.get("X-API-Version")).toBe("1");
+    // Error responses also carry it.
+    const missing = await app.request("/sessions/does-not-exist/state");
+    expect(missing.headers.get("X-API-Version")).toBe("1");
+  });
+
   it("drain rejects mutating ops with 503 but allows reads", async () => {
     const { app, sessionsDir, lifecycle } = makeApp();
     cleanup = sessionsDir;

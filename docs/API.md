@@ -2,6 +2,20 @@
 
 Request-response over HTTP/1.1. `Content-Type: application/json` on all requests with bodies. Auth via `Authorization: Bearer <token>` when the server is configured with tokens.
 
+## Response headers
+
+Every response carries these headers:
+
+| Header | Meaning |
+|---|---|
+| `X-Request-Id` | UUID for this request. Echoed in structured logs and in error response bodies. |
+| `X-Worker-Id` | Stable id of the process that served the request. Load balancers MUST honor it for session affinity in multi-worker deployments. |
+| `X-API-Version` | Major version of the API contract (currently `1`). Clients MAY assert compatibility on this. Breaking changes ship under `/v2/*` while current paths keep honoring v1. |
+
+## Versioning contract
+
+From v1.0 the routes, error codes, request/response shapes, and response headers listed in this document are a **stable contract**. Additive changes (new optional fields, new error codes) do not bump the major. Breaking changes ship under a new prefix (`/v2/*`) while the current paths continue to serve v1. The `X-API-Version` header lets clients pin and alert on unexpected drift.
+
 ## Endpoints
 
 | Method | Path | Purpose |

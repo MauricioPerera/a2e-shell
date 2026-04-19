@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createServer as createHttpsServer } from "node:https";
 import { serve } from "@hono/node-server";
 import { buildApp } from "./http/server.js";
 import { createLifecycle } from "./http/lifecycle.js";
@@ -58,12 +59,41 @@ setInterval(() => manager.sweepExpired(), 60_000).unref();
 const lifecycle = createLifecycle();
 const app = buildApp({ manager, config, lifecycle });
 
-const server = serve({ fetch: app.fetch, port: config.port });
+// TLS is opt-in. When A2E_TLS_CERT_PATH and A2E_TLS_KEY_PATH are both set the
+// server listens over HTTPS; otherwise it listens over plain HTTP (which must
+// sit behind a TLS-terminating proxy in production). A2E_TLS_CLIENT_CA_PATH
+// turns on mTLS: only clients presenting a cert signed by the given CA bundle
+// are allowed through (requestCert + rejectUnauthorized).
+const tlsCertPath = process.env.A2E_TLS_CERT_PATH;
+const tlsKeyPath = process.env.A2E_TLS_KEY_PATH;
+const tlsClientCaPath = process.env.A2E_TLS_CLIENT_CA_PATH;
+const tlsEnabled = Boolean(tlsCertPath && tlsKeyPath);
+
+const server = tlsEnabled
+  ? serve({
+      fetch: app.fetch,
+      port: config.port,
+      createServer: createHttpsServer,
+      serverOptions: (() => {
+        const cert = fs.readFileSync(tlsCertPath!);
+        const key = fs.readFileSync(tlsKeyPath!);
+        const opts: import("node:https").ServerOptions = { cert, key };
+        if (tlsClientCaPath) {
+          opts.ca = fs.readFileSync(tlsClientCaPath);
+          opts.requestCert = true;
+          opts.rejectUnauthorized = true;
+        }
+        return opts;
+      })(),
+    })
+  : serve({ fetch: app.fetch, port: config.port });
 logger.info({
   event: "server.listening",
   port: config.port,
   worker_id: config.workerId,
   auth_enabled: config.authTokens.length > 0,
+  tls_enabled: tlsEnabled,
+  mtls_enabled: tlsEnabled && Boolean(tlsClientCaPath),
   rate_limit_per_minute: config.rateLimitPerMinute,
   rate_limit_create_per_minute: config.rateLimitCreatePerMinute,
   redact_keys_count: config.redactEnvKeys.length,

@@ -21,6 +21,16 @@ Environment variables, deployment modes, Dockerfile, and capability configuratio
 | `A2E_PID_FILE` | (unset) | If set, the node process writes its real PID here at startup. Use this (not shell `$!`) when the launch command includes env-var prefixes, which can fork an intermediate subshell |
 | `A2E_SESSION_PERSISTENCE` | `false` | **Experimental.** When `true`, sessions write state.json atomically on every mutation. Enables `POST /sessions/:id/resume` to rebuild state after process restarts. Binding values are stored inline — disk cost scales with active bindings |
 
+### TLS (opt-in)
+
+| Var | Default | Effect |
+|---|---|---|
+| `A2E_TLS_CERT_PATH` | (unset) | Path to PEM certificate. When set together with `A2E_TLS_KEY_PATH`, the server listens over HTTPS instead of HTTP |
+| `A2E_TLS_KEY_PATH` | (unset) | Path to PEM private key. Must be set together with `A2E_TLS_CERT_PATH` |
+| `A2E_TLS_CLIENT_CA_PATH` | (unset) | Path to PEM CA bundle. When set (and TLS is on), enables mTLS: clients must present a certificate signed by this CA (`requestCert` + `rejectUnauthorized`) |
+
+TLS is optional because the typical deployment terminates TLS at an ingress (ALB, nginx, Envoy, Caddy). Turn it on only when a2e-shell faces the network directly. mTLS is the recommended posture when exposing the server without a TLS-terminating proxy in front.
+
 ### Credential redaction
 
 | Var | Default | Effect |

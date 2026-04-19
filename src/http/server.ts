@@ -48,6 +48,15 @@ export type AppVariables = { request_id: string };
 export type AppEnv = { Variables: AppVariables };
 export type AppContext = Context<AppEnv>;
 
+/**
+ * API schema version. Current routes, error codes, and request/response
+ * shapes are treated as a stable contract from v1.0 onward. Breaking changes
+ * require a new major (v2) served under `/v2/*` while the current paths
+ * continue to honor v1. Every response carries `X-API-Version` so clients
+ * can assert they're talking to a compatible server.
+ */
+export const API_VERSION = "1";
+
 export function buildApp(deps: ServerDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
@@ -59,6 +68,7 @@ export function buildApp(deps: ServerDeps): Hono<AppEnv> {
 
   app.use("*", requestId());
   app.use("*", workerIdHeader(deps.config.workerId));
+  app.use("*", apiVersionHeader());
   app.use("*", observability());
   app.use("*", drainGate(deps.lifecycle));
   app.use("*", bodyLimit(deps.config.maxRequestBytes));
@@ -148,6 +158,13 @@ function requestId(): MiddlewareHandler<AppEnv> {
 function workerIdHeader(workerId: string): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
     c.header("X-Worker-Id", workerId);
+    await next();
+  };
+}
+
+function apiVersionHeader(): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    c.header("X-API-Version", API_VERSION);
     await next();
   };
 }
