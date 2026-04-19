@@ -22,6 +22,7 @@ export function mountState(app: Hono<AppEnv>, manager: SessionManager): void {
     }
     const resolved = await validateCwd(parsed.data.cwd, manager.allowedCwdPrefixes());
     session.setCwd(resolved);
+    await session.flush();
     return c.json(buildStateResponse(session), 200);
   });
 
@@ -44,6 +45,7 @@ export function mountState(app: Hono<AppEnv>, manager: SessionManager): void {
       for (const [k, v] of Object.entries(parsed.data.set)) session.setEnv(k, v);
     }
     if (parsed.data.unset) session.unsetEnv(parsed.data.unset);
+    await session.flush();
     return c.json(buildStateResponse(session), 200);
   });
 

@@ -46,6 +46,7 @@ From v1.0 the routes, error codes, request/response shapes, and response headers
 | `413` | Request body over `A2E_MAX_REQUEST_BYTES` (`PAYLOAD_TOO_LARGE`) |
 | `429` | Rate limit exceeded (`RATE_LIMITED`) |
 | `500` | Internal error (`INTERNAL`) |
+| `503` | Graceful shutdown in progress (`SERVICE_UNAVAILABLE`) |
 
 Error responses:
 
@@ -57,7 +58,7 @@ The `message` field passes through a server-level redactor built from `A2E_REDAC
 
 ## Error codes inventory
 
-`PARSE_ERROR` · `CAPABILITY_DENIED` · `INTERPOLATION_REJECTED` · `SCOPE_MISS` · `TIMEOUT` · `SIZE_LIMIT` · `UPSTREAM_ERROR` · `INTERNAL` · `UNAUTHORIZED` · `NOT_FOUND` · `CONFLICT` · `PAYLOAD_TOO_LARGE` · `RATE_LIMITED` · `NOT_IMPLEMENTED_V1`.
+`PARSE_ERROR` · `CAPABILITY_DENIED` · `INTERPOLATION_REJECTED` · `SCOPE_MISS` · `TIMEOUT` · `SIZE_LIMIT` · `UPSTREAM_ERROR` · `INTERNAL` · `UNAUTHORIZED` · `NOT_FOUND` · `CONFLICT` · `PAYLOAD_TOO_LARGE` · `RATE_LIMITED` · `SERVICE_UNAVAILABLE` · `NOT_IMPLEMENTED_V1`.
 
 Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`, `SCOPE_MISS`, `CAPABILITY_DENIED`) can appear inside an `ExecResponse.error` at HTTP 200 when the session survives but the specific exec failed.
 

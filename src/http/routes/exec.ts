@@ -68,6 +68,10 @@ export function mountExec(app: Hono<AppEnv>, manager: SessionManager): void {
       req: pickTranscriptableReq(req),
       res,
     });
+    // When persistence is on, block the response until state.json is durable.
+    // Noop otherwise. Without this, a crash between the 200 and the async
+    // write would silently drop the turn from POST /resume's view.
+    await session.flush();
     return c.json(res, 200);
   });
 }
@@ -139,6 +143,7 @@ async function streamExecSSE(
         req: pickTranscriptableReq(req),
         res,
       });
+      await session.flush();
     } catch (e) {
       const code = e instanceof A2EError ? e.code : "INTERNAL";
       const message = e instanceof Error ? e.message : String(e);
@@ -163,6 +168,7 @@ async function respondHit(
     req: pickTranscriptableReq(req),
     res: hit,
   });
+  await session.flush();
   return c.json(hit, 200);
 }
 

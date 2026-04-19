@@ -82,6 +82,12 @@ export interface Session {
   snapshot(): SessionSnapshot;
   /** Await any in-flight persistence write. No-op when persistence is off. */
   flush(): Promise<void>;
+  /**
+   * Mark state as dirty so the next flush writes it. Used by the manager
+   * after create() to force an initial state.json before returning 201.
+   * No-op when persistence is off.
+   */
+  touchForPersistence(): void;
 
   /** Returns a cached ExecResponse if the key was seen within TTL, else null. */
   idempotencyGet(key: string): ExecResponse | null;
@@ -324,6 +330,9 @@ export function createSession(init: SessionInit): Session {
     },
     flush() {
       return persistFlush ?? Promise.resolve();
+    },
+    touchForPersistence() {
+      markDirty();
     },
 
     snapshot(): SessionSnapshot {

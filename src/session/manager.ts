@@ -146,6 +146,14 @@ export function createManager(cfg: ManagerConfig): SessionManager {
         has_catalog: catalog !== null,
         expires_at: expires_at.toISOString(),
       });
+      // Force an initial state.json write so POST /sessions/:id/resume can
+      // find this session even if the process crashes before any mutation
+      // (otherwise the client holds a session_id that will never resolve).
+      // Noop when persistence is disabled.
+      if (cfg.persistenceEnabled) {
+        session.touchForPersistence();
+        await session.flush();
+      }
       return session;
     },
 
