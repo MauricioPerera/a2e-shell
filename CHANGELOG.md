@@ -10,8 +10,9 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ### Added
 - Performance SLO benchmark harness: [tests/benchmarks/http.bench.ts](tests/benchmarks/http.bench.ts) drives the Hono app in-process and asserts p95 latencies against budgets (`GET /healthz` ≤ 10ms, `POST /sessions` ≤ 200ms, `/exec` intercept ≤ 50ms, `/exec` subprocess ≤ 300ms). All budgets env-overridable.
+- Token-consumption benchmark: [tests/benchmarks/tokens.ts](tests/benchmarks/tokens.ts) measures prompt-token savings vs. raw-dump (naive MCP / bash-tool) behavior across fixtures (tiny text, medium JSON, JSONL list, huge JSON, binary) for single-turn and 5-turn transcripts. Headline ratios on large outputs: **32× on JSONL lists, 131× on huge JSON, 164× on binary**. Canonical format loses on tiny outputs (overhead dominates below ~500 bytes) — surfaced honestly in the table.
 - CI workflow [.github/workflows/ci.yml](.github/workflows/ci.yml): `verify` (typecheck + tests) and `bench` (SLO gate, uploads JSON artifact). Regressions fail the PR.
-- `npm run bench:http` script.
+- `npm run bench:http` + `npm run bench:tokens` scripts.
 
 ### Changed
 - Knocks one of the two items off the v1.0.0-final blocker list (perf SLO benchmarks). External security audit remains out-of-band.
