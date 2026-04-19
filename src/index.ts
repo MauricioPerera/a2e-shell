@@ -24,6 +24,7 @@ const config = {
   maxRequestBytes: envInt("A2E_MAX_REQUEST_BYTES", 1_048_576),
   redactEnvKeys,
   rateLimitPerMinute: envInt("A2E_RATE_LIMIT_PER_MINUTE", 120),
+  rateLimitCreatePerMinute: envInt("A2E_RATE_LIMIT_CREATE_PER_MINUTE", 20),
 };
 
 const sessionsDir = process.env.A2E_SESSIONS_DIR ?? "./sessions";
@@ -39,6 +40,7 @@ const manager = createManager({
   redactEnvKeys,
   catalogBootstrapTimeoutMs: envInt("A2E_CATALOG_BOOTSTRAP_TIMEOUT_MS", 60_000),
   catalogCache,
+  allowedCwdPrefixes: envList("A2E_ALLOWED_CWD_PREFIXES"),
 });
 
 setInterval(() => manager.sweepExpired(), 60_000).unref();

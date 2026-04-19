@@ -124,24 +124,30 @@ The LLM is treated as **hostile** from the server's perspective:
 ### Enforcement layers (in order)
 
 1. **Zod schema** — structural validation. Strict objects reject unknown fields.
-2. **Key/path validation** — reserved env keys rejected, cwd must be absolute+existing+directory.
+2. **Key/path validation** — reserved env keys rejected; cwd must be absolute, exist, resolve without symlinks, and lie within `A2E_ALLOWED_CWD_PREFIXES`.
 3. **Interpolation** — only `${$bare_name}` tokens accepted. Any other `${...}` form rejected.
 4. **Command substitution rejected** — `$(...)` and backticks trigger `CAPABILITY_DENIED` at parse.
 5. **Binary allowlist** — static parse of the command splits on shell operators, checks argv[0] of each segment against `SAFE_BUILTINS ∪ binaries_allowlist \ BLOCKED_BUILTINS`.
-6. **Subprocess isolation** — `spawn bash -c <cmd>` with argv-array (never `shell: true` with concatenation), explicit cwd, custom env (no inheritance of host PATH or secrets not in overlay), timeout, streaming size cap.
-7. **Redactor** — scrubs known secret values from stdout/stderr before anything reaches the formatter.
-8. **Transcript redaction** — secrets that might appear in the request body (in `command`, `stdin`) are scrubbed from the serialized JSONL entry before write.
-9. **HTTP error redaction** — server-level redactor runs over all `A2EError.message` values in `onError`.
+6. **Reserved env at mutation time** — `session.setEnv` / `unsetEnv` throw `CAPABILITY_DENIED` on any reserved key. This is the choke point for both `export`/`unset` intercepts AND PATCH `/env`, so `LD_PRELOAD` / `A2E_CATALOG_*` / etc. cannot be shadowed through any path.
+7. **Subprocess isolation** — `spawn` invokes an absolute bash path (resolved at startup) with argv-array (never `shell: true` with concatenation), explicit cwd, custom env (no inheritance of host PATH or secrets not in overlay; catalog env vars applied AFTER overlay so they win), timeout, streaming size cap.
+8. **Redactor** — scrubs known secret values from stdout/stderr before anything reaches the formatter.
+9. **Transcript redaction** — secrets that might appear in the request body (in `command`, `stdin`) are scrubbed from the serialized JSONL entry before write.
+10. **HTTP error redaction** — server-level redactor runs over all `A2EError.message` values in `onError`.
+11. **Rate limiting** — per-session and per-caller-on-create limiters cap request volume at the app layer.
 
 ### What the LLM cannot do
 
 - Escape the subprocess into the parent Node process (no `eval`, no `vm`, no `isolated-vm`, no FFI).
 - Source arbitrary code (`source`, `.`, `eval` blocked at the allowlist layer).
-- Exfiltrate credentials (never inherits the parent env — only HOME/USER/LANG/LC_ALL + session overlay + PATH derived from allowlist).
+- Exfiltrate credentials (never inherits the parent env — only HOME/USER/LANG/LC_ALL + session overlay + PATH derived from allowlist + catalog env).
+- Hijack the dynamic linker (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`, etc.): reserved-env enforcement in `session.setEnv` blocks both intercept and PATCH paths.
+- Shadow catalog paths (`A2E_CATALOG_*` also reserved; and even if enforcement were missed, the catalog env is applied AFTER overlay when building subprocess env).
+- Point `initial_cwd` or PATCH cwd at arbitrary paths: canonical path must lie within `A2E_ALLOWED_CWD_PREFIXES`, and symlink-resolution divergence is rejected.
 - Bypass PATH via inline env: the allowlist enforcer strips leading `KEY=val` prefixes before checking argv[0].
 - Hide in command substitution: `$(...)` and backticks rejected.
 - Break out via quoted operators: the segment splitter respects `"..."` and `'...'`.
 - Leak secrets via transcript or HTTP error messages: both pass through the redactor.
+- Cause concurrent exec duplication under network retries: idempotency key uses both a cache AND an in-flight promise map, collapsing concurrent same-key calls to a single execution.
 
 ### What the LLM *could* do within the rules
 

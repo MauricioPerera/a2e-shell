@@ -12,7 +12,9 @@ Environment variables, deployment modes, Dockerfile, and capability configuratio
 | `A2E_SESSIONS_DIR` | `./sessions` | Filesystem root for session directories (transcripts, catalogs, cache) |
 | `A2E_MAX_REQUEST_BYTES` | `1048576` (1 MiB) | Per-request body limit enforced by `Content-Length` check |
 | `A2E_AUTH_TOKENS` | (empty) | Comma-separated bearer tokens. Empty = auth disabled (dev only) |
-| `A2E_RATE_LIMIT_PER_MINUTE` | `120` | Per-session request cap; `0` = disabled |
+| `A2E_RATE_LIMIT_PER_MINUTE` | `120` | Per-session cap on `/sessions/:id` and `/sessions/:id/*`; `0` = disabled |
+| `A2E_RATE_LIMIT_CREATE_PER_MINUTE` | `20` | Cap on `POST /sessions` (keyed by bearer token, else `anon`); `0` = disabled |
+| `A2E_ALLOWED_CWD_PREFIXES` | `<sessionsDir>` | Comma-separated absolute prefixes allowed for `initial_cwd` / PATCH cwd. Empty env = default (sessionsDir only) |
 
 ### Credential redaction
 

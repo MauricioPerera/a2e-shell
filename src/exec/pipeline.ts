@@ -115,27 +115,33 @@ async function applyIntercept(
     | { type: "export"; key: string; value: string }
     | { type: "unset"; keys: readonly string[] },
 ): Promise<ExecResponse> {
-  if (mutation.type === "cd") {
-    const target = path.isAbsolute(mutation.path)
-      ? mutation.path
-      : path.resolve(session.getCwd(), mutation.path);
-    try {
-      const st = await fsp.stat(target);
-      if (!st.isDirectory()) {
+  try {
+    if (mutation.type === "cd") {
+      const target = path.isAbsolute(mutation.path)
+        ? mutation.path
+        : path.resolve(session.getCwd(), mutation.path);
+      try {
+        const st = await fsp.stat(target);
+        if (!st.isDirectory()) {
+          return errorResponse(
+            new A2EError("UPSTREAM_ERROR", `cd: not a directory: ${target}`),
+          );
+        }
+      } catch {
         return errorResponse(
-          new A2EError("UPSTREAM_ERROR", `cd: not a directory: ${target}`),
+          new A2EError("UPSTREAM_ERROR", `cd: no such directory: ${target}`),
         );
       }
-    } catch {
-      return errorResponse(
-        new A2EError("UPSTREAM_ERROR", `cd: no such directory: ${target}`),
-      );
+      session.setCwd(target);
+    } else if (mutation.type === "export") {
+      session.setEnv(mutation.key, mutation.value);
+    } else {
+      session.unsetEnv(mutation.keys);
     }
-    session.setCwd(target);
-  } else if (mutation.type === "export") {
-    session.setEnv(mutation.key, mutation.value);
-  } else {
-    session.unsetEnv(mutation.keys);
+  } catch (e) {
+    // session.setEnv / unsetEnv throw CAPABILITY_DENIED on reserved keys.
+    // Surface as exec-level error so the LLM sees the refusal.
+    return errorResponse(e);
   }
   return format({
     exit_code: null,
@@ -153,18 +159,21 @@ function buildSubprocessEnv(session: Session): Record<string, string> {
     const v = process.env[k];
     if (v !== undefined) base[k] = v;
   }
-  // Expose catalog paths so the LLM can discover via shell conventions
-  // instead of having to thread them through the prompt at every turn.
-  if (session.catalog) {
-    base.A2E_CATALOG_INDEX = session.catalog.index_dir;
-    base.A2E_CATALOG_CONTENT = session.catalog.content_dir;
-    base.A2E_CATALOG_REACHABILITY = session.catalog.reachability.report_path;
-  }
   const overlay = session.getEnvOverlay();
   const path_env = session.policy.path_env;
+  // Catalog env vars MUST win over any overlay — session.setEnv rejects
+  // A2E_CATALOG_* as reserved, but defense-in-depth: apply catalog env AFTER
+  // overlay so even a skipped validation can't shadow them.
+  const catalogEnv: Record<string, string> = {};
+  if (session.catalog) {
+    catalogEnv.A2E_CATALOG_INDEX = session.catalog.index_dir;
+    catalogEnv.A2E_CATALOG_CONTENT = session.catalog.content_dir;
+    catalogEnv.A2E_CATALOG_REACHABILITY = session.catalog.reachability.report_path;
+  }
   return {
     ...base,
     ...overlay,
+    ...catalogEnv,
     PATH: path_env,
   };
 }

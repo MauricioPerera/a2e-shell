@@ -10,6 +10,7 @@
  */
 
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 
 export interface RunInput {
   readonly command: string;
@@ -29,7 +30,30 @@ export interface RunResult {
   readonly timed_out: boolean;
 }
 
-const BASH_PATH = process.env.A2E_BASH_PATH ?? "bash";
+/**
+ * Resolve an absolute path to bash at module load. Using an absolute path on
+ * spawn means the subprocess's PATH (built from the capability allowlist) is
+ * irrelevant for finding bash itself — the shell that runs the LLM's command
+ * is never gated by the allowlist, only the binaries the command invokes.
+ */
+const BASH_PATH = resolveBashPath();
+
+function resolveBashPath(): string {
+  const override = process.env.A2E_BASH_PATH;
+  if (override) return override;
+  const candidates = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"];
+  for (const p of candidates) {
+    try {
+      const st = fs.statSync(p);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return p;
+    } catch { /* try next */ }
+  }
+  // Fallback to bare name; spawn will use the parent process's PATH.
+  return "bash";
+}
+
+/** Exposed so tests can verify resolution happened. */
+export const RESOLVED_BASH_PATH = BASH_PATH;
 
 export async function run(input: RunInput): Promise<RunResult> {
   const start = Date.now();

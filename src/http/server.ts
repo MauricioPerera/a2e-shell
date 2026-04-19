@@ -15,7 +15,10 @@ export interface ServerConfig {
   readonly port: number;
   readonly maxRequestBytes: number;
   readonly redactEnvKeys: readonly string[];
+  /** Per-session rate limit on /sessions/:id/* routes. 0 = disabled. */
   readonly rateLimitPerMinute: number;
+  /** Rate limit for POST /sessions (keyed by bearer token, else 'anon'). 0 = disabled. */
+  readonly rateLimitCreatePerMinute: number;
 }
 
 export interface ServerDeps {
@@ -40,7 +43,22 @@ export function buildApp(deps: ServerDeps): Hono<AppEnv> {
   app.use("/sessions/*", auth(deps.config.authTokens));
   app.use("/sessions", auth(deps.config.authTokens));
   if (deps.config.rateLimitPerMinute > 0) {
-    app.use("/sessions/:id/*", rateLimit(deps.config.rateLimitPerMinute));
+    const sessionRateLimit = rateLimit(deps.config.rateLimitPerMinute, (c) => {
+      const id = c.req.param("id");
+      return id ? `session:${id}` : null;
+    });
+    app.use("/sessions/:id", sessionRateLimit);
+    app.use("/sessions/:id/*", sessionRateLimit);
+  }
+  if (deps.config.rateLimitCreatePerMinute > 0) {
+    app.use("/sessions", rateLimit(deps.config.rateLimitCreatePerMinute, (c) => {
+      // No session id yet at creation time. Key by bearer token (one bucket per
+      // client), falling back to 'anon' (one shared bucket in dev). This caps
+      // catalog-clone storms even when auth is disabled.
+      const h = c.req.header("authorization") ?? "";
+      const m = /^Bearer\s+(.+)$/.exec(h);
+      return m ? `create:token:${m[1]}` : "create:anon";
+    }));
   }
 
   app.onError((err, c) => {
@@ -102,37 +120,42 @@ function auth(tokens: readonly string[]): MiddlewareHandler<AppEnv> {
   };
 }
 
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_GC_INTERVAL_MS = 30_000;
+
 /**
- * Per-session fixed-window rate limiter. Counts all requests against
- * `/sessions/:id/*` for that session id. Windows expire after 60s + 10s slack
- * so memory usage stays bounded at ~active-sessions.
+ * Fixed-window rate limiter with pluggable key extractor. Unreferenced windows
+ * are GC'd periodically (timer-based, not hit-based) so memory stays bounded
+ * even under low traffic.
  */
-function rateLimit(perMinute: number): MiddlewareHandler<AppEnv> {
+function rateLimit(
+  perMinute: number,
+  getKey: (c: import("hono").Context<AppEnv>) => string | null,
+): MiddlewareHandler<AppEnv> {
   const windows = new Map<string, { start: number; count: number }>();
-  const WINDOW_MS = 60_000;
-  const GC_EVERY = 1000;
-  let hits = 0;
-  return async (c, next) => {
-    const id = c.req.param("id");
-    if (!id) { await next(); return; }
+  const timer = setInterval(() => {
     const now = Date.now();
-    const existing = windows.get(id);
-    if (!existing || now - existing.start >= WINDOW_MS) {
-      windows.set(id, { start: now, count: 1 });
+    for (const [k, v] of windows) {
+      if (now - v.start >= RATE_LIMIT_WINDOW_MS + 10_000) windows.delete(k);
+    }
+  }, RATE_LIMIT_GC_INTERVAL_MS);
+  timer.unref();
+
+  return async (c, next) => {
+    const key = getKey(c);
+    if (!key) { await next(); return; }
+    const now = Date.now();
+    const existing = windows.get(key);
+    if (!existing || now - existing.start >= RATE_LIMIT_WINDOW_MS) {
+      windows.set(key, { start: now, count: 1 });
     } else {
       existing.count++;
       if (existing.count > perMinute) {
         throw new A2EError(
           "RATE_LIMITED",
-          `rate limit exceeded for session '${id}' (${perMinute}/min)`,
+          `rate limit exceeded for '${key}' (${perMinute}/min)`,
           429,
         );
-      }
-    }
-    hits++;
-    if (hits % GC_EVERY === 0) {
-      for (const [k, v] of windows) {
-        if (now - v.start >= WINDOW_MS + 10_000) windows.delete(k);
       }
     }
     await next();

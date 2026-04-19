@@ -6,7 +6,11 @@ import { buildApp } from "../../src/http/server.js";
 import { createManager } from "../../src/session/manager.js";
 import { createCatalogCache } from "../../src/catalog/cache.js";
 
-function makeApp(opts?: { authTokens?: readonly string[]; rateLimitPerMinute?: number }) {
+function makeApp(opts?: {
+  authTokens?: readonly string[];
+  rateLimitPerMinute?: number;
+  rateLimitCreatePerMinute?: number;
+}) {
   const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), "http-"));
   const catalogCache = createCatalogCache({
     enabled: false, cacheDir: path.join(sessionsDir, ".cache"), refreshSeconds: 3600, filterBlobs: false,
@@ -16,6 +20,7 @@ function makeApp(opts?: { authTokens?: readonly string[]; rateLimitPerMinute?: n
     redactEnvKeys: [],
     catalogBootstrapTimeoutMs: 30_000,
     catalogCache,
+    allowedCwdPrefixes: [],
   });
   const app = buildApp({
     manager,
@@ -25,6 +30,7 @@ function makeApp(opts?: { authTokens?: readonly string[]; rateLimitPerMinute?: n
       maxRequestBytes: 1_048_576,
       redactEnvKeys: [],
       rateLimitPerMinute: opts?.rateLimitPerMinute ?? 0,
+      rateLimitCreatePerMinute: opts?.rateLimitCreatePerMinute ?? 0,
     },
   });
   return { app, sessionsDir };
@@ -149,5 +155,69 @@ describe("HTTP server", () => {
     }
     expect(hits.filter((s) => s === 200).length).toBe(3);
     expect(hits.filter((s) => s === 429).length).toBe(2);
+  });
+
+  it("create rate limit fires at cap (keyed by bearer token)", async () => {
+    const { app, sessionsDir } = makeApp({
+      authTokens: ["tok-x"],
+      rateLimitCreatePerMinute: 2,
+    });
+    cleanup = sessionsDir;
+    const hits: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const r = await postJson(app, "/sessions", {}, { authorization: "Bearer tok-x" });
+      hits.push(r.status);
+    }
+    expect(hits.filter((s) => s === 201).length).toBe(2);
+    expect(hits.filter((s) => s === 429).length).toBe(2);
+  });
+
+  it("idempotent exec: second call with same key returns cached + idempotent_hit", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const create = await postJson(app, "/sessions", {
+      capabilities: { binaries_allowlist: ["echo", "printf"] },
+    });
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    const r1 = await postJson(app, `/sessions/${sid}/exec`, {
+      command: "printf 'hello world'",
+      idempotency_key: "op-1",
+    });
+    const b1 = (await r1.json()) as { preview: unknown; idempotent_hit?: boolean };
+    expect(b1.idempotent_hit).toBeUndefined();
+
+    const r2 = await postJson(app, `/sessions/${sid}/exec`, {
+      command: "printf 'hello world'",
+      idempotency_key: "op-1",
+    });
+    const b2 = (await r2.json()) as { preview: unknown; idempotent_hit?: boolean };
+    expect(b2.idempotent_hit).toBe(true);
+    expect(b2.preview).toEqual(b1.preview);
+  });
+
+  it("export of reserved env via intercept → CAPABILITY_DENIED", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const create = await postJson(app, "/sessions", {});
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    const r = await postJson(app, `/sessions/${sid}/exec`, {
+      command: "export LD_PRELOAD=/evil.so",
+    });
+    const body = (await r.json()) as { error?: { code: string } };
+    expect(r.status).toBe(200);
+    expect(body.error?.code).toBe("CAPABILITY_DENIED");
+  });
+
+  it("initial_cwd outside allowed prefix → 400", async () => {
+    // Default prefix is sessionsDir; /etc is outside.
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const r = await postJson(app, "/sessions", { initial_cwd: "/etc" });
+    expect(r.status).toBe(400);
+    const body = (await r.json()) as { error: string; message: string };
+    expect(body.error).toBe("PARSE_ERROR");
+    expect(body.message).toContain("allowed prefixes");
   });
 });

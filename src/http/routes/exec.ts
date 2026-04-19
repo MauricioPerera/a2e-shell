@@ -1,8 +1,9 @@
 import type { Hono } from "hono";
 import { A2EError } from "../../errors.js";
-import { ExecRequest } from "../../io/protocol.js";
+import { ExecRequest, type ExecResponse } from "../../io/protocol.js";
 import { executeTurn } from "../../exec/pipeline.js";
 import type { SessionManager } from "../../session/manager.js";
+import type { Session } from "../../session/state.js";
 import type { AppEnv } from "../server.js";
 
 export function mountExec(app: Hono<AppEnv>, manager: SessionManager): void {
@@ -27,42 +28,62 @@ export function mountExec(app: Hono<AppEnv>, manager: SessionManager): void {
     const session = manager.get(id); // may throw NOT_FOUND / CONFLICT
     const req = parsed.data;
 
-    // Idempotency check: same key within TTL returns the cached response
-    // without re-executing the command. Transcript still records the hit so
-    // audit trails stay honest.
-    if (req.idempotency_key) {
-      const cached = session.idempotencyGet(req.idempotency_key);
+    // Idempotency flow. Three outcomes:
+    //   1. Cache hit (previous call completed within TTL) → return cached + hit flag.
+    //   2. In-flight hit (concurrent call registered) → await its promise + hit flag.
+    //   3. Cold path → register our exec as in-flight BEFORE awaiting, then cache
+    //      the result. The get+inflight+register sequence is sync (no awaits) so
+    //      no interleaving can sneak a second exec through for the same key.
+    const key = req.idempotency_key;
+    if (key) {
+      const cached = session.idempotencyGet(key);
       if (cached) {
-        const hitResponse = { ...cached, idempotent_hit: true };
-        await session.appendTranscript({
-          t: session.nextTurn(),
-          at: new Date().toISOString(),
-          req: redactReq(req),
-          res: hitResponse,
-        });
-        return c.json(hitResponse, 200);
+        return await respondHit(c, session, req, cached);
+      }
+      const inflight = session.idempotencyInflight(key);
+      if (inflight) {
+        const res = await inflight;
+        return await respondHit(c, session, req, res);
       }
     }
 
-    const res = await executeTurn(session, req);
-
-    if (req.idempotency_key) {
-      session.idempotencyPut(req.idempotency_key, res);
-    }
+    const execPromise = executeTurn(session, req);
+    if (key) session.idempotencyRegister(key, execPromise);
+    const res = await execPromise;
+    if (key) session.idempotencyPut(key, res);
 
     await session.appendTranscript({
       t: session.nextTurn(),
       at: new Date().toISOString(),
-      req: redactReq(req),
+      req: pickTranscriptableReq(req),
       res,
     });
-
     return c.json(res, 200);
   });
 }
 
-/** Never echo credentials in the transcript; stdin/command already interpolated by the pipeline. */
-function redactReq(req: import("../../io/protocol.js").ExecRequest) {
+async function respondHit(
+  c: import("hono").Context<AppEnv>,
+  session: Session,
+  req: import("../../io/protocol.js").ExecRequest,
+  cached: ExecResponse,
+) {
+  const hit: ExecResponse = { ...cached, idempotent_hit: true };
+  await session.appendTranscript({
+    t: session.nextTurn(),
+    at: new Date().toISOString(),
+    req: pickTranscriptableReq(req),
+    res: hit,
+  });
+  return c.json(hit, 200);
+}
+
+/**
+ * Strip non-transcriptable fields (idempotency_key) from the request before
+ * recording. The remaining content still passes through the session redactor
+ * inside session.appendTranscript.
+ */
+function pickTranscriptableReq(req: import("../../io/protocol.js").ExecRequest) {
   return {
     command: req.command,
     ...(req.bind_as ? { bind_as: req.bind_as } : {}),

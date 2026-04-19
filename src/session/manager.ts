@@ -20,6 +20,12 @@ export interface ManagerConfig {
   readonly redactEnvKeys: readonly string[];
   readonly catalogBootstrapTimeoutMs: number;
   readonly catalogCache: CatalogCache;
+  /**
+   * Absolute path prefixes under which `initial_cwd` and PATCH /cwd are allowed
+   * to point. Defaults to [sessionsDir] when unset. Empty array disables the
+   * check (NOT recommended for production).
+   */
+  readonly allowedCwdPrefixes: readonly string[];
 }
 
 export interface SessionManager {
@@ -28,10 +34,16 @@ export interface SessionManager {
   delete(id: string): Promise<boolean>;
   list(): readonly string[];
   sweepExpired(now?: Date): number;
+  /** Accessor so routes can read the same prefix policy as create(). */
+  allowedCwdPrefixes(): readonly string[];
 }
 
 export function createManager(cfg: ManagerConfig): SessionManager {
   const sessions = new Map<string, Session>();
+  // Default prefix: sessionsDir (every created session's default cwd lives here).
+  const effectiveCwdPrefixes = cfg.allowedCwdPrefixes.length > 0
+    ? cfg.allowedCwdPrefixes
+    : [cfg.sessionsDir];
 
   return {
     async create(req) {
@@ -57,7 +69,9 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       const defaultCwd = path.join(cfg.sessionsDir, id);
       // Ensure the default session dir exists before any cwd validation.
       await fsp.mkdir(defaultCwd, { recursive: true });
-      const initial_cwd = req.initial_cwd ? await validateCwd(req.initial_cwd) : defaultCwd;
+      const initial_cwd = req.initial_cwd
+        ? await validateCwd(req.initial_cwd, effectiveCwdPrefixes)
+        : defaultCwd;
       const transcript_path = path.join(cfg.sessionsDir, id, "transcript.jsonl");
       const expires_at = new Date(Date.now() + policy.max_session_ttl_s * 1000);
 
@@ -135,6 +149,7 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       }
       return n;
     },
+    allowedCwdPrefixes: () => effectiveCwdPrefixes,
   };
 }
 

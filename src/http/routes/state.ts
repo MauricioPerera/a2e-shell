@@ -20,7 +20,7 @@ export function mountState(app: Hono<AppEnv>, manager: SessionManager): void {
     if (!parsed.success) {
       throw new A2EError("PARSE_ERROR", parsed.error.message, 400);
     }
-    const resolved = await validateCwd(parsed.data.cwd);
+    const resolved = await validateCwd(parsed.data.cwd, manager.allowedCwdPrefixes());
     session.setCwd(resolved);
     return c.json(buildStateResponse(session), 200);
   });
@@ -36,6 +36,10 @@ export function mountState(app: Hono<AppEnv>, manager: SessionManager): void {
     }
     validateEnvMap(parsed.data.set);
     validateUnsetList(parsed.data.unset);
+    // session.setEnv / unsetEnv are the authoritative gate (they enforce
+    // RESERVED_ENV_KEYS). The schema-level validators above give earlier,
+    // more specific errors for UX; the session-level check catches anything
+    // that slipped through (e.g. future schema drift).
     if (parsed.data.set) {
       for (const [k, v] of Object.entries(parsed.data.set)) session.setEnv(k, v);
     }

@@ -192,7 +192,9 @@ Same schema as `GET /sessions/:id/state`.
 }
 ```
 
-Reserved keys rejected: `PATH`, `HOME`, `USER`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_BIND_NOW`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONSTARTUP`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_AUTH_SOCK`, `IFS`, `CDPATH`, `BASH_ENV`, `ENV` (case-insensitive).
+Reserved keys rejected: `PATH`, `HOME`, `USER`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_BIND_NOW`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONSTARTUP`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_AUTH_SOCK`, `IFS`, `CDPATH`, `BASH_ENV`, `ENV`, `A2E_CATALOG_INDEX`, `A2E_CATALOG_CONTENT`, `A2E_CATALOG_REACHABILITY` (case-insensitive).
+
+The same list is enforced by `session.setEnv` / `unsetEnv`, so `export LD_PRELOAD=...` or `unset A2E_CATALOG_INDEX` via `POST /exec` also fail with `CAPABILITY_DENIED` (200 + exec-level error body).
 
 ### Response — `200 OK`
 
@@ -260,9 +262,12 @@ Auth is NOT scoped (no per-token capabilities in v1). Treat tokens like API keys
 
 ## Rate limiting
 
-Per-session fixed-window, 60-second resolution. Applied to `/sessions/:id/*` (all endpoints under a session). Configured by `A2E_RATE_LIMIT_PER_MINUTE` (default 120, 0 = disabled).
+Two independent fixed-window (60s) limiters:
 
-Exceeded → `429 RATE_LIMITED`.
+- **Per-session** (`A2E_RATE_LIMIT_PER_MINUTE`, default 120): applied to `/sessions/:id` and `/sessions/:id/*`. Keyed by session id.
+- **Per-caller on create** (`A2E_RATE_LIMIT_CREATE_PER_MINUTE`, default 20): applied to `POST /sessions`. Keyed by bearer token (or `anon` when auth is disabled). Tighter cap to throttle catalog-clone storms.
+
+Either `0` disables that limiter. Exceeded → `429 RATE_LIMITED`.
 
 ## Idempotency
 

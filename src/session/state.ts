@@ -7,6 +7,7 @@ import type { Binding } from "../exec/interpolate.js";
 import type { Redactor } from "../credentials/redactor.js";
 import type { CatalogInfo, ExecResponse } from "../io/protocol.js";
 import { A2EError } from "../errors.js";
+import { isReservedEnvKey } from "./validation.js";
 import { openTranscript, type Transcript, type TranscriptEntry } from "./transcript.js";
 
 export interface SessionInit {
@@ -56,6 +57,10 @@ export interface Session {
   idempotencyGet(key: string): ExecResponse | null;
   /** Stores an ExecResponse under the key. TTL-bounded, FIFO-evicting at cap. */
   idempotencyPut(key: string, response: ExecResponse): void;
+  /** Returns an in-flight Promise for the key if one exists, else null. */
+  idempotencyInflight(key: string): Promise<ExecResponse> | null;
+  /** Registers a Promise as in-flight. Auto-released on settle. */
+  idempotencyRegister(key: string, promise: Promise<ExecResponse>): void;
 }
 
 const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
@@ -66,6 +71,7 @@ export function createSession(init: SessionInit): Session {
   const bindings = new Map<string, Binding>();
   const transcript = openTranscript(init.transcript_path);
   const idempotencyCache = new Map<string, { response: ExecResponse; expires: number }>();
+  const idempotencyInflight = new Map<string, Promise<ExecResponse>>();
   let cwd = init.initial_cwd;
   let historySize = 0;
   let turn = 0;
@@ -92,9 +98,26 @@ export function createSession(init: SessionInit): Session {
 
     getEnvOverlay: () => ({ ...env }),
     setEnv(k, v) {
+      // Hard block on reserved keys. This is the single point of truth: both
+      // intercepted `export` and PATCH /env pass through here, so no path can
+      // bypass the reserved-key check (e.g. LD_PRELOAD via intercept).
+      if (isReservedEnvKey(k)) {
+        throw new A2EError(
+          "CAPABILITY_DENIED",
+          `env: '${k}' is reserved and cannot be set`,
+        );
+      }
       env[k] = v;
     },
     unsetEnv(keys) {
+      for (const k of keys) {
+        if (isReservedEnvKey(k)) {
+          throw new A2EError(
+            "CAPABILITY_DENIED",
+            `env: '${k}' is reserved and cannot be unset`,
+          );
+        }
+      }
       for (const k of keys) delete env[k];
     },
 
@@ -176,6 +199,20 @@ export function createSession(init: SessionInit): Session {
         if (oldest !== undefined) idempotencyCache.delete(oldest);
       }
       idempotencyCache.set(key, { response, expires: Date.now() + IDEMPOTENCY_TTL_MS });
+    },
+    idempotencyInflight(key) {
+      return idempotencyInflight.get(key) ?? null;
+    },
+    idempotencyRegister(key, promise) {
+      idempotencyInflight.set(key, promise);
+      // Auto-release on settle so memory bounded by concurrent-key-count.
+      promise.finally(() => {
+        // Only delete if this is still the registered one (paranoid guard in
+        // case of reregistration — shouldn't happen under single-threaded loop).
+        if (idempotencyInflight.get(key) === promise) {
+          idempotencyInflight.delete(key);
+        }
+      }).catch(() => { /* swallow — real rejection is surfaced by the awaiting caller */ });
     },
   };
 }
