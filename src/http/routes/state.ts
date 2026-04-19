@@ -49,8 +49,9 @@ export function mountState(app: Hono<AppEnv>, manager: SessionManager): void {
 
   app.get("/sessions/:id/transcript", async (c) => {
     const session = manager.get(c.req.param("id"));
+    // Use readFullTranscript so rotated segments are transparently included.
     const lines: string[] = [];
-    for await (const e of session.transcript.read()) {
+    for await (const e of session.readFullTranscript()) {
       lines.push(JSON.stringify(e));
     }
     return c.text(lines.join("\n") + (lines.length ? "\n" : ""), 200, {

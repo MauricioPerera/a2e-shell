@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import type { Hono } from "hono";
 import { A2EError } from "../../errors.js";
 import type { SessionManager } from "../../session/manager.js";
@@ -9,21 +10,25 @@ import type { AppEnv } from "../server.js";
  * non-deterministic). Returns a deterministic hash of the transcript's responses
  * so callers can compare two sessions that claim equivalence.
  *
- * True command re-execution against mocked upstreams is v2.
+ * Hash covers ALL segments (rotated + current) so rotation is transparent.
  */
 export function mountReplay(app: Hono<AppEnv>, manager: SessionManager): void {
   app.post("/sessions/:id/replay", async (c) => {
     const session = manager.get(c.req.param("id"));
-    const count = await session.transcript.count();
+    const h = crypto.createHash("sha256");
+    let count = 0;
+    for await (const entry of session.readFullTranscript()) {
+      h.update(JSON.stringify(entry.res));
+      count++;
+    }
     if (count === 0) {
       throw new A2EError("CONFLICT", "transcript is empty; nothing to replay", 409);
     }
-    const hash = await session.transcript.hashFinal();
     return c.json(
       {
         replayed: count,
         diverged_at: null,
-        final_state_hash: hash,
+        final_state_hash: h.digest("hex"),
       },
       200,
     );

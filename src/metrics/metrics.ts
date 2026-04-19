@@ -88,3 +88,9 @@ export const redactorSecrets = new Gauge({
   help: "Number of secrets loaded into the server-level redactor.",
   registers: [registry],
 });
+
+export const transcriptRotations = new Counter({
+  name: "a2e_transcript_rotations_total",
+  help: "Transcript segment rotations (sessions reaching the soft cap).",
+  registers: [registry],
+});

@@ -134,10 +134,15 @@ function requestId(): MiddlewareHandler<AppEnv> {
   };
 }
 
+/** Paths whose per-request log would be pure noise (scraped or probed often). */
+const SILENT_LOG_PATHS: ReadonlySet<string> = new Set(["/metrics", "/healthz"]);
+
 /**
  * Observability middleware: logs request start/end with timing and status,
  * records HTTP metrics. Route label uses the Hono match pattern (e.g.
- * "/sessions/:id/exec") so cardinality stays bounded.
+ * "/sessions/:id/exec") so cardinality stays bounded. `/metrics` and
+ * `/healthz` are excluded from per-request logs (they're scraped/probed at
+ * high frequency and generate pure noise); metrics are still recorded.
  */
 function observability(): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
@@ -151,14 +156,16 @@ function observability(): MiddlewareHandler<AppEnv> {
     const routeLabel = `${method} /${route}`;
     httpRequests.inc({ route: routeLabel, status: String(status) });
     httpDurationMs.observe({ route: routeLabel }, duration);
-    logger.info({
-      event: "http.request",
-      request_id: c.get("request_id"),
-      method,
-      path,
-      status,
-      duration_ms: duration,
-    });
+    if (!SILENT_LOG_PATHS.has(path)) {
+      logger.info({
+        event: "http.request",
+        request_id: c.get("request_id"),
+        method,
+        path,
+        status,
+        duration_ms: duration,
+      });
+    }
   };
 }
 

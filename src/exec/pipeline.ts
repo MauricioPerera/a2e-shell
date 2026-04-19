@@ -17,18 +17,21 @@ import { execDurationMs, execTotal, errorsTotal } from "../metrics/metrics.js";
 import * as path from "node:path";
 import * as fsp from "node:fs/promises";
 
+type TurnOutcome = "ok" | "error" | "intercept";
+interface TurnResult {
+  readonly response: ExecResponse;
+  readonly outcome: TurnOutcome;
+}
+
 export async function executeTurn(
   session: Session,
   req: ExecRequest,
 ): Promise<ExecResponse> {
   const start = Date.now();
   try {
-    const result = await runTurn(session, req);
-    const isError = result.error !== undefined;
-    const isIntercept = result.status_line === "[exit 0]" && result.shape === null && result.preview === null;
-    const outcome = isError ? "error" : isIntercept ? "intercept" : "ok";
+    const { response, outcome } = await runTurn(session, req);
     execTotal.inc({ outcome });
-    if (isError && result.error) errorsTotal.inc({ code: result.error.code });
+    if (outcome === "error" && response.error) errorsTotal.inc({ code: response.error.code });
     execDurationMs.observe(Date.now() - start);
     logger.info({
       event: "exec",
@@ -38,17 +41,25 @@ export async function executeTurn(
       command_bytes: req.command.length,
       has_bind: req.bind_as !== undefined,
       has_idempotency_key: req.idempotency_key !== undefined,
-      ...(isError && result.error ? { error_code: result.error.code } : {}),
-      ...(result.truncated ? { truncated: true } : {}),
+      ...(outcome === "error" && response.error ? { error_code: response.error.code } : {}),
+      ...(response.truncated ? { truncated: true } : {}),
     });
-    return result;
+    return response;
   } catch (e) {
-    // Defense in depth: runTurn wraps every branch in errorResponse, but if
-    // something truly exceptional slips through, classify and surface.
+    // Defense in depth: runTurn is wrapped such that every branch surfaces
+    // via errorResponse. Landing here means an unexpected throw slipped past
+    // that contract — log loudly so operators catch it quickly.
     execTotal.inc({ outcome: "error" });
     execDurationMs.observe(Date.now() - start);
     const res = errorResponse(e);
     if (res.error) errorsTotal.inc({ code: res.error.code });
+    logger.error({
+      event: "exec.unhandled",
+      session_id: session.id,
+      duration_ms: Date.now() - start,
+      err: e instanceof Error ? { message: e.message, stack: e.stack } : String(e),
+      ...(res.error ? { error_code: res.error.code } : {}),
+    });
     return res;
   }
 }
@@ -56,12 +67,12 @@ export async function executeTurn(
 async function runTurn(
   session: Session,
   req: ExecRequest,
-): Promise<ExecResponse> {
+): Promise<TurnResult> {
   let interpolated: string;
   try {
     interpolated = interpolate(req.command, session.getBindings());
   } catch (e) {
-    return errorResponse(e);
+    return { response: errorResponse(e), outcome: "error" };
   }
 
   // Intercept branch (cd/export/unset) — no spawn.
@@ -74,7 +85,7 @@ async function runTurn(
   try {
     enforceBinaryAllowlist(interpolated, session.policy);
   } catch (e) {
-    return errorResponse(e);
+    return { response: errorResponse(e), outcome: "error" };
   }
 
   // Resolve stdin (may also interpolate).
@@ -83,7 +94,7 @@ async function runTurn(
     try {
       stdin = interpolate(req.stdin, session.getBindings());
     } catch (e) {
-      return errorResponse(e);
+      return { response: errorResponse(e), outcome: "error" };
     }
   }
 
@@ -108,9 +119,12 @@ async function runTurn(
   });
 
   if (runResult.timed_out) {
-    return errorResponse(
-      new A2EError("TIMEOUT", `command exceeded timeout ${timeout_ms}ms`),
-    );
+    return {
+      response: errorResponse(
+        new A2EError("TIMEOUT", `command exceeded timeout ${timeout_ms}ms`),
+      ),
+      outcome: "error",
+    };
   }
 
   const stdoutClean = session.redactor.redact(runResult.stdout);
@@ -139,11 +153,11 @@ async function runTurn(
     } catch (e) {
       // Binding failed AFTER exec completed. Surface as an error response so
       // the LLM knows the binding was NOT captured and can reduce scope.
-      return errorResponse(e);
+      return { response: errorResponse(e), outcome: "error" };
     }
   }
 
-  return response;
+  return { response, outcome: runResult.exit_code === 0 ? "ok" : "error" };
 }
 
 async function applyIntercept(
@@ -152,7 +166,7 @@ async function applyIntercept(
     | { type: "cd"; path: string }
     | { type: "export"; key: string; value: string }
     | { type: "unset"; keys: readonly string[] },
-): Promise<ExecResponse> {
+): Promise<TurnResult> {
   try {
     if (mutation.type === "cd") {
       const expanded = expandHome(mutation.path, session);
@@ -162,14 +176,20 @@ async function applyIntercept(
       try {
         const st = await fsp.stat(target);
         if (!st.isDirectory()) {
-          return errorResponse(
-            new A2EError("UPSTREAM_ERROR", `cd: not a directory: ${target}`),
-          );
+          return {
+            response: errorResponse(
+              new A2EError("UPSTREAM_ERROR", `cd: not a directory: ${target}`),
+            ),
+            outcome: "error",
+          };
         }
       } catch {
-        return errorResponse(
-          new A2EError("UPSTREAM_ERROR", `cd: no such directory: ${target}`),
-        );
+        return {
+          response: errorResponse(
+            new A2EError("UPSTREAM_ERROR", `cd: no such directory: ${target}`),
+          ),
+          outcome: "error",
+        };
       }
       session.setCwd(target);
     } else if (mutation.type === "export") {
@@ -180,15 +200,16 @@ async function applyIntercept(
   } catch (e) {
     // session.setEnv / unsetEnv throw CAPABILITY_DENIED on reserved keys.
     // Surface as exec-level error so the LLM sees the refusal.
-    return errorResponse(e);
+    return { response: errorResponse(e), outcome: "error" };
   }
-  return format({
+  const response = format({
     exit_code: null,
     stdout: new Uint8Array(0),
     stderr: new Uint8Array(0),
     preview_bytes_limit: session.policy.preview_bytes,
     stderr_bytes_limit: session.policy.stderr_preview_bytes,
   });
+  return { response, outcome: "intercept" };
 }
 
 /**

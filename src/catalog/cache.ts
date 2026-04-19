@@ -115,6 +115,9 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
       cloneArgs.push(repoUrl, mirrorPath);
       await runGit(cloneArgs, timeoutMs, undefined, redactor, authEnv);
       await markRefreshed(mirrorPath);
+      // Seed the access marker now so LRU doesn't see stat() fallback on a
+      // newly-cloned mirror before any materialize finishes.
+      await touchAccess(mirrorPath);
       catalogMirrorEvents.inc({ event: "created" });
       catalogMirrorsActive.inc();
       logger.info({
@@ -260,10 +263,98 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
     return { resolved_sha: sha, used_cache: existedBefore, mirror_path: mirrorPath };
   }
 
+  /**
+   * Sweep pass with inFlight awareness:
+   *   1. Skip mirrors currently being cloned/refreshed (race-free eviction).
+   *   2. Worktree prune every non-in-flight mirror.
+   *   3. Measure sizes; evict idle (no live worktrees + not in-flight) oldest-
+   *      first until total is under maxBytes.
+   *   4. Re-check `hasLiveWorktrees` immediately before rm to minimize the
+   *      window in which a session could materialize a worktree we're about
+   *      to delete.
+   */
+  async function doSweepInner(): Promise<SweepResult> {
+    const mirrors = (await listMirrors(cfg.cacheDir))
+      .filter((m) => !inFlight.has(m));
+    let pruned = 0;
+    for (const m of mirrors) {
+      if (await pruneOne(m)) {
+        pruned++;
+        catalogMirrorEvents.inc({ event: "pruned" });
+      }
+    }
+    const withStats = await Promise.all(
+      mirrors.map(async (m) => ({
+        path: m,
+        size: await dirSizeBytes(m).catch(() => 0),
+        lastAccess: await readLastAccess(m),
+        hasLiveWorktrees: await hasLiveWorktrees(m),
+      })),
+    );
+    const totalBefore = withStats.reduce((a, m) => a + m.size, 0);
+
+    let evicted = 0;
+    let totalAfter = totalBefore;
+    if (cfg.maxBytes > 0 && totalBefore > cfg.maxBytes) {
+      const evictable = withStats
+        .filter((m) => !m.hasLiveWorktrees)
+        .sort((a, b) => a.lastAccess - b.lastAccess);
+      for (const m of evictable) {
+        if (totalAfter <= cfg.maxBytes) break;
+        // Race-tightening re-check: inFlight AND live-worktrees both revalidated.
+        if (inFlight.has(m.path)) continue;
+        if (await hasLiveWorktrees(m.path)) continue;
+        try {
+          await fsp.rm(path.dirname(m.path), { recursive: true, force: true });
+          totalAfter -= m.size;
+          evicted++;
+          catalogMirrorsActive.dec();
+          catalogMirrorEvents.inc({ event: "evicted" });
+          logger.info({
+            event: "catalog.mirror.evicted",
+            mirror_path: m.path,
+            size_bytes: m.size,
+            last_access_ms_ago: Date.now() - m.lastAccess,
+          });
+        } catch (e) {
+          logger.warn({
+            event: "catalog.mirror.evict_failed",
+            mirror_path: m.path,
+            err: String(e),
+          });
+        }
+      }
+    }
+    if (pruned > 0 || evicted > 0) {
+      logger.info({
+        event: "catalog.sweep",
+        mirrors_before: mirrors.length,
+        mirrors_pruned: pruned,
+        mirrors_evicted: evicted,
+        total_bytes_before: totalBefore,
+        total_bytes_after: totalAfter,
+      });
+    }
+    return {
+      total_bytes_before: totalBefore,
+      total_bytes_after: totalAfter,
+      mirrors_before: mirrors.length,
+      mirrors_evicted: evicted,
+      mirrors_pruned: pruned,
+    };
+  }
+
+  // Seed the active-mirrors gauge from disk so restarts don't under-report.
+  if (cfg.enabled) {
+    listMirrors(cfg.cacheDir)
+      .then((ms) => catalogMirrorsActive.set(ms.length))
+      .catch(() => { /* best-effort */ });
+  }
+
   let sweepTimer: NodeJS.Timeout | null = null;
   if (cfg.enabled && cfg.sweepIntervalSeconds > 0) {
     sweepTimer = setInterval(() => {
-      doSweep(cfg).catch((e) => {
+      doSweepInner().catch((e) => {
         logger.warn({ event: "catalog.sweep.failed", err: String(e) });
       });
     }, cfg.sweepIntervalSeconds * 1000);
@@ -276,7 +367,7 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
       return materializeViaMirror(input);
     },
     async sweep() {
-      return cfg.enabled ? doSweep(cfg) : {
+      return cfg.enabled ? doSweepInner() : {
         total_bytes_before: 0,
         total_bytes_after: 0,
         mirrors_before: 0,
@@ -290,83 +381,6 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
         sweepTimer = null;
       }
     },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Sweep / LRU / prune
-// ---------------------------------------------------------------------------
-
-/**
- * One sweep pass:
- *   1. Run `git worktree prune` on every mirror to clear stale metadata from
- *      crashed or hard-killed sessions.
- *   2. Measure total cache size.
- *   3. If over cap, evict mirrors in ascending last-access order, skipping
- *      those with live worktrees. Eviction = `rm -rf <mirror_dir>`.
- */
-async function doSweep(cfg: CatalogCacheConfig): Promise<SweepResult> {
-  const mirrors = await listMirrors(cfg.cacheDir);
-  let pruned = 0;
-  for (const m of mirrors) {
-    if (await pruneOne(m)) pruned++;
-  }
-  const withStats = await Promise.all(
-    mirrors.map(async (m) => ({
-      path: m,
-      size: await dirSizeBytes(m).catch(() => 0),
-      lastAccess: await readLastAccess(m),
-      hasLiveWorktrees: await hasLiveWorktrees(m),
-    })),
-  );
-  const totalBefore = withStats.reduce((a, m) => a + m.size, 0);
-
-  let evicted = 0;
-  let totalAfter = totalBefore;
-  if (cfg.maxBytes > 0 && totalBefore > cfg.maxBytes) {
-    // Evict idle mirrors first, oldest access first.
-    const evictable = withStats
-      .filter((m) => !m.hasLiveWorktrees)
-      .sort((a, b) => a.lastAccess - b.lastAccess);
-    for (const m of evictable) {
-      if (totalAfter <= cfg.maxBytes) break;
-      try {
-        await fsp.rm(path.dirname(m.path), { recursive: true, force: true });
-        totalAfter -= m.size;
-        evicted++;
-        catalogMirrorsActive.dec();
-        catalogMirrorEvents.inc({ event: "pruned" });
-        logger.info({
-          event: "catalog.mirror.evicted",
-          mirror_path: m.path,
-          size_bytes: m.size,
-          last_access_ms_ago: Date.now() - m.lastAccess,
-        });
-      } catch (e) {
-        logger.warn({
-          event: "catalog.mirror.evict_failed",
-          mirror_path: m.path,
-          err: String(e),
-        });
-      }
-    }
-  }
-  if (pruned > 0 || evicted > 0) {
-    logger.info({
-      event: "catalog.sweep",
-      mirrors_before: mirrors.length,
-      mirrors_pruned: pruned,
-      mirrors_evicted: evicted,
-      total_bytes_before: totalBefore,
-      total_bytes_after: totalAfter,
-    });
-  }
-  return {
-    total_bytes_before: totalBefore,
-    total_bytes_after: totalAfter,
-    mirrors_before: mirrors.length,
-    mirrors_evicted: evicted,
-    mirrors_pruned: pruned,
   };
 }
 

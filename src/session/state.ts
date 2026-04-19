@@ -3,6 +3,7 @@
  */
 
 import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import type { ResolvedPolicy } from "../capabilities/policy.js";
 import type { Binding } from "../exec/interpolate.js";
 import type { Redactor } from "../credentials/redactor.js";
@@ -10,6 +11,7 @@ import type { CatalogInfo, ExecResponse } from "../io/protocol.js";
 import { A2EError } from "../errors.js";
 import { isReservedEnvKey } from "./validation.js";
 import { logger } from "../logging/logger.js";
+import { transcriptRotations } from "../metrics/metrics.js";
 import { openTranscript, type Transcript, type TranscriptEntry } from "./transcript.js";
 
 export interface SessionInit {
@@ -37,6 +39,11 @@ export interface Session {
   readonly policy: ResolvedPolicy;
   readonly redactor: Redactor;
   readonly expiresAt: Date;
+  /**
+   * The CURRENT transcript segment. After rotation this points to the
+   * newly-opened file; consumers that need full history must use
+   * `readFullTranscript()`.
+   */
   readonly transcript: Transcript;
   readonly catalog: CatalogInfo | null;
 
@@ -52,6 +59,12 @@ export interface Session {
   bind(name: string, binding: Binding): void;
 
   appendTranscript(entry: TranscriptEntry): Promise<void>;
+  /**
+   * Iterate every transcript entry chronologically: rotated segments (by
+   * timestamp-sorted filename) first, then the current segment. Use this
+   * for `GET /sessions/:id/transcript` so rotation is transparent to clients.
+   */
+  readFullTranscript(): AsyncIterable<TranscriptEntry>;
   nextTurn(): number;
   snapshot(): SessionSnapshot;
 
@@ -96,11 +109,32 @@ export function createSession(init: SessionInit): Session {
     }
     transcript = openTranscript(init.transcript_path);
     transcriptBytes = 0;
+    transcriptRotations.inc();
     logger.info({
       event: "transcript.rotated",
       session_id: init.session_id,
       rotated_to: rotatedPath,
     });
+  }
+
+  /**
+   * Scan the transcript directory for rotated segments matching
+   * `<basename>.<iso-ts>.jsonl`. Sort by timestamp (ISO-8601 sorts
+   * lexicographically) so older segments yield first.
+   */
+  async function listRotatedSegments(): Promise<string[]> {
+    const dir = path.dirname(init.transcript_path);
+    const base = path.basename(init.transcript_path);
+    const prefix = `${base}.`;
+    const suffix = ".jsonl";
+    let entries: string[] = [];
+    try {
+      entries = await fsp.readdir(dir);
+    } catch { return []; }
+    return entries
+      .filter((e) => e.startsWith(prefix) && e.endsWith(suffix) && e !== base)
+      .sort()
+      .map((e) => path.join(dir, e));
   }
 
   function totalBindingBytes(): number {
@@ -114,7 +148,9 @@ export function createSession(init: SessionInit): Session {
     policy: init.policy,
     redactor: init.redactor,
     expiresAt: init.expires_at,
-    transcript,
+    // Getter so callers always see the CURRENT segment after rotation,
+    // not the captured-at-create-time reference.
+    get transcript() { return transcript; },
     catalog: init.catalog,
 
     getCwd: () => cwd,
@@ -196,6 +232,18 @@ export function createSession(init: SessionInit): Session {
       transcriptBytes += byteLen;
       historySize++;
     },
+    readFullTranscript(): AsyncIterable<TranscriptEntry> {
+      return {
+        [Symbol.asyncIterator]: async function* () {
+          for (const segPath of await listRotatedSegments()) {
+            const seg = openTranscript(segPath);
+            for await (const entry of seg.read()) yield entry;
+          }
+          for await (const entry of transcript.read()) yield entry;
+        },
+      };
+    },
+
     nextTurn() {
       turn++;
       return turn;

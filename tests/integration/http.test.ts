@@ -220,4 +220,33 @@ describe("HTTP server", () => {
     expect(body.error).toBe("PARSE_ERROR");
     expect(body.message).toContain("allowed prefixes");
   });
+
+  it("cd ~ expands HOME in intercept (no spawn needed)", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    // Use a real, always-existing dir as HOME for the session.
+    const home = os.tmpdir();
+    const create = await postJson(app, "/sessions", {
+      initial_env: { CUSTOM: "x" }, // HOME is reserved; can't inject via request.
+    });
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    // Intercept `cd ~` with process.env.HOME (tmpdir is guaranteed to exist).
+    const prevHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const r = await postJson(app, `/sessions/${sid}/exec`, { command: "cd ~" });
+      const body = (await r.json()) as { status_line: string; error?: unknown };
+      expect(body.status_line).toBe("[exit 0]");
+      expect(body.error).toBeUndefined();
+    } finally {
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      else delete process.env.HOME;
+    }
+
+    const state = await app.request(`/sessions/${sid}/state`);
+    const ss = (await state.json()) as { cwd: string };
+    // cd resolved to HOME → cwd is the tmpdir path.
+    expect(ss.cwd).toBe(path.resolve(home));
+  });
 });
