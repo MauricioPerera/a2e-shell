@@ -73,6 +73,7 @@ curl -s -X DELETE http://localhost:8080/sessions/$SID \
 | [docs/CATALOG.md](./docs/CATALOG.md) | Both | Catalog feature: spec, auth, pinning, cache |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Maintainers | Security model, module layout, failure modes |
 | [docs/LLM-PROMPT.md](./docs/LLM-PROMPT.md) | LLM | 500-token system prompt consumed by the agent |
+| [docs/ROADMAP.md](./docs/ROADMAP.md) | All | Release plan v0.2 → v2.0 + out-of-scope |
 | [CONTRACT.md](./CONTRACT.md) | Implementers | Formal contract for the implementation (acceptance criteria) |
 | [GRAMMAR.ebnf](./GRAMMAR.ebnf) | (reserved) | Bounded-mode grammar for v2 |
 
