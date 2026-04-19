@@ -290,6 +290,71 @@ describe("HTTP server", () => {
     expect(health.status).toBe(200);
   });
 
+  it("SSE streaming: Accept text/event-stream yields start/stdout/done events", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const create = await postJson(app, "/sessions", {
+      capabilities: { binaries_allowlist: ["printf", "bash"] },
+    });
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    const res = await app.request(`/sessions/${sid}/exec`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify({ command: "printf 'hello streaming'" }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+    // Parse SSE frames: blocks separated by blank lines, each has `event:` and `data:` fields.
+    const body = await res.text();
+    const frames = body.split(/\n\n/).map((f) => f.trim()).filter(Boolean);
+    const events = frames.map((f) => {
+      const eventLine = f.split(/\n/).find((l) => l.startsWith("event:"));
+      const dataLine = f.split(/\n/).find((l) => l.startsWith("data:"));
+      return {
+        event: eventLine?.slice("event:".length).trim() ?? "",
+        data: JSON.parse(dataLine?.slice("data:".length).trim() ?? "{}"),
+      };
+    });
+
+    const names = events.map((e) => e.event);
+    expect(names[0]).toBe("start");
+    expect(names[names.length - 1]).toBe("done");
+    expect(names).toContain("stdout");
+
+    const stdoutChunk = events.find((e) => e.event === "stdout");
+    expect(stdoutChunk?.data.chunk).toContain("hello streaming");
+
+    const done = events[events.length - 1]!;
+    expect(done.data.status_line).toBe("[exit 0]");
+    expect(done.data.preview).toBe("hello streaming");
+  });
+
+  it("SSE streaming: error on capability-denied emits done with error body", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const create = await postJson(app, "/sessions", {
+      capabilities: { binaries_allowlist: ["echo"] },
+    });
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    const res = await app.request(`/sessions/${sid}/exec`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+      },
+      body: JSON.stringify({ command: "rm -rf /tmp/foo" }),
+    });
+    const text = await res.text();
+    expect(text).toContain("event: done");
+    expect(text).toContain("CAPABILITY_DENIED");
+  });
+
   it("waitForDrain resolves once in-flight reaches 0", async () => {
     const { app, sessionsDir, lifecycle } = makeApp();
     cleanup = sessionsDir;

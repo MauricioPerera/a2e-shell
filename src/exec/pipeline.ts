@@ -23,13 +23,30 @@ interface TurnResult {
   readonly outcome: TurnOutcome;
 }
 
+/**
+ * Optional streaming sink. Callbacks receive redacted UTF-8 text chunks
+ * decoded incrementally (stream-mode TextDecoder) so multi-byte chars that
+ * land across chunk boundaries stay intact.
+ *
+ * Known limitation: secrets that span a chunk boundary won't be caught by
+ * the per-chunk redactor. Rare in practice (Node pipe chunks are typically
+ * 16-64 KiB; tokens are <256 chars) but the non-streaming response still
+ * runs the redactor over the aggregate, so the final `done` event carries
+ * fully scrubbed content.
+ */
+export interface ExecSink {
+  onStdout?(text: string): void;
+  onStderr?(text: string): void;
+}
+
 export async function executeTurn(
   session: Session,
   req: ExecRequest,
+  sink?: ExecSink,
 ): Promise<ExecResponse> {
   const start = Date.now();
   try {
-    const { response, outcome } = await runTurn(session, req);
+    const { response, outcome } = await runTurn(session, req, sink);
     execTotal.inc({ outcome });
     if (outcome === "error" && response.error) errorsTotal.inc({ code: response.error.code });
     execDurationMs.observe(Date.now() - start);
@@ -67,6 +84,7 @@ export async function executeTurn(
 async function runTurn(
   session: Session,
   req: ExecRequest,
+  sink?: ExecSink,
 ): Promise<TurnResult> {
   let interpolated: string;
   try {
@@ -109,6 +127,25 @@ async function runTurn(
 
   const env = buildSubprocessEnv(session);
 
+  // Stream-mode TextDecoders keep multi-byte UTF-8 sequences whole across
+  // chunk boundaries. Created per-call so state doesn't bleed between turns.
+  const stdoutDec = new TextDecoder("utf-8", { fatal: false });
+  const stderrDec = new TextDecoder("utf-8", { fatal: false });
+  const onStdout = sink?.onStdout
+    ? (bytes: Uint8Array) => {
+        const clean = session.redactor.redact(bytes);
+        const text = stdoutDec.decode(clean, { stream: true });
+        if (text.length > 0) sink.onStdout!(text);
+      }
+    : undefined;
+  const onStderr = sink?.onStderr
+    ? (bytes: Uint8Array) => {
+        const clean = session.redactor.redact(bytes);
+        const text = stderrDec.decode(clean, { stream: true });
+        if (text.length > 0) sink.onStderr!(text);
+      }
+    : undefined;
+
   const runResult = await run({
     command: interpolated,
     cwd: session.getCwd(),
@@ -116,7 +153,19 @@ async function runTurn(
     ...(stdin !== undefined ? { stdin } : {}),
     timeout_ms,
     max_response_bytes: policy.max_response_bytes,
+    ...(onStdout ? { onStdout } : {}),
+    ...(onStderr ? { onStderr } : {}),
   });
+
+  // Flush any trailing bytes from incomplete multi-byte sequences.
+  if (sink?.onStdout) {
+    const tail = stdoutDec.decode();
+    if (tail.length > 0) sink.onStdout(tail);
+  }
+  if (sink?.onStderr) {
+    const tail = stderrDec.decode();
+    if (tail.length > 0) sink.onStderr(tail);
+  }
 
   if (runResult.timed_out) {
     return {

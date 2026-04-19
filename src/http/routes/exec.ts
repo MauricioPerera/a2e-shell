@@ -1,7 +1,8 @@
 import type { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { A2EError } from "../../errors.js";
 import { ExecRequest, type ExecResponse } from "../../io/protocol.js";
-import { executeTurn } from "../../exec/pipeline.js";
+import { executeTurn, type ExecSink } from "../../exec/pipeline.js";
 import type { SessionManager } from "../../session/manager.js";
 import type { Session } from "../../session/state.js";
 import type { AppEnv } from "../server.js";
@@ -27,6 +28,15 @@ export function mountExec(app: Hono<AppEnv>, manager: SessionManager): void {
     }
     const session = manager.get(id); // may throw NOT_FOUND / CONFLICT
     const req = parsed.data;
+
+    // Streaming mode: Accept: text/event-stream. Emits SSE events during the
+    // exec (`stdout`, `stderr` chunks, `done` with canonical response). The
+    // non-streaming path handles idempotency; streaming skips it because the
+    // cached response wouldn't reproduce the original chunk timing.
+    const accept = c.req.header("accept") ?? "";
+    if (accept.toLowerCase().includes("text/event-stream")) {
+      return streamExecSSE(c, session, req);
+    }
 
     // Idempotency flow. Three outcomes:
     //   1. Cache hit (previous call completed within TTL) → return cached + hit flag.
@@ -59,6 +69,84 @@ export function mountExec(app: Hono<AppEnv>, manager: SessionManager): void {
       res,
     });
     return c.json(res, 200);
+  });
+}
+
+/**
+ * SSE-streaming variant of the exec endpoint. Emits:
+ *   event: start   data: { session_id, command_bytes, at }
+ *   event: stdout  data: { chunk: "<utf-8 text>" }
+ *   event: stderr  data: { chunk: "<utf-8 text>" }
+ *   event: done    data: <ExecResponse>
+ *
+ * Chunk events may arrive interleaved; the `done` payload is always the same
+ * canonical response the non-streaming route would have returned (fully
+ * redacted, aggregated). Clients that need deterministic full output should
+ * rely on `done`, not on accumulating chunks.
+ */
+async function streamExecSSE(
+  c: import("hono").Context<AppEnv>,
+  session: Session,
+  req: import("../../io/protocol.js").ExecRequest,
+) {
+  return streamSSE(c, async (stream) => {
+    try {
+      await stream.writeSSE({
+        event: "start",
+        data: JSON.stringify({
+          session_id: session.id,
+          command_bytes: req.command.length,
+          at: new Date().toISOString(),
+        }),
+      });
+
+      // Buffer events coming from synchronous chunk handlers; the SSE writer
+      // awaits, but chunk handlers can fire faster than we flush. Draining is
+      // serialized with `flushing` so events stay in order.
+      const queue: Array<{ event: string; data: string }> = [];
+      let flushing = false;
+      async function drain(): Promise<void> {
+        if (flushing) return;
+        flushing = true;
+        try {
+          while (queue.length > 0) {
+            const ev = queue.shift()!;
+            await stream.writeSSE(ev);
+          }
+        } finally {
+          flushing = false;
+        }
+      }
+
+      const sink: ExecSink = {
+        onStdout: (text) => {
+          queue.push({ event: "stdout", data: JSON.stringify({ chunk: text }) });
+          void drain();
+        },
+        onStderr: (text) => {
+          queue.push({ event: "stderr", data: JSON.stringify({ chunk: text }) });
+          void drain();
+        },
+      };
+
+      const res = await executeTurn(session, req, sink);
+      queue.push({ event: "done", data: JSON.stringify(res) });
+      await drain();
+
+      await session.appendTranscript({
+        t: session.nextTurn(),
+        at: new Date().toISOString(),
+        req: pickTranscriptableReq(req),
+        res,
+      });
+    } catch (e) {
+      const code = e instanceof A2EError ? e.code : "INTERNAL";
+      const message = e instanceof Error ? e.message : String(e);
+      await stream.writeSSE({
+        event: "error",
+        data: JSON.stringify({ code, message }),
+      });
+    }
   });
 }
 

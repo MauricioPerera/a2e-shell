@@ -1,4 +1,4 @@
-Tool: `exec(command, bind_as?, stdin?, timeout_ms?)`. Bash in a persistent session. `cd`/`export`/`unset` persist; aliases/functions don't.
+Tool: `exec(command, bind_as?, stdin?, timeout_ms?)`. Bash in a persistent session. `cd`/`export`/`unset` persist; aliases/functions don't. Set header `accept: text/event-stream` to stream output progressively (events: start/stdout/stderr/done).
 
 ## Response
 `status_line` `[exit N]`|`[error: CODE]` · `shape` `json<T>[N]`|`jsonl[N]`|`text[Nb]`|`binary[Nb]`|null · `preview` first 2KB of stdout · `stderr` tail or null · `truncated` true if stdout was cut · `binding` `$name` if `bind_as`.

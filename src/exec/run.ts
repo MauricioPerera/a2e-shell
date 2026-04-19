@@ -19,6 +19,14 @@ export interface RunInput {
   readonly stdin?: string;
   readonly timeout_ms: number;
   readonly max_response_bytes: number;
+  /**
+   * Optional streaming hooks. Called synchronously on every accepted chunk
+   * (post-size-clipping), so the caller sees exactly the bytes that will end
+   * up in the final buffer. Uncalled beyond the cap — `truncated` on the
+   * final RunResult signals the caller that the stream was cut.
+   */
+  readonly onStdout?: (chunk: Uint8Array) => void;
+  readonly onStderr?: (chunk: Uint8Array) => void;
 }
 
 export interface RunResult {
@@ -83,29 +91,37 @@ export async function run(input: RunInput): Promise<RunResult> {
         truncated = true;
         return;
       }
+      let accepted: Buffer;
       if (chunk.length <= space) {
+        accepted = chunk;
         stdoutChunks.push(chunk);
         stdoutLen += chunk.length;
       } else {
         // Defensive copy: subarray shares memory with the source Buffer. If
         // any downstream consumer (redactor, formatter) were to mutate bytes,
         // the original pool could surface stale data. Buffer.from clones.
-        stdoutChunks.push(Buffer.from(chunk.subarray(0, space)));
+        accepted = Buffer.from(chunk.subarray(0, space));
+        stdoutChunks.push(accepted);
         stdoutLen += space;
         truncated = true;
       }
+      if (input.onStdout) input.onStdout(accepted);
     });
 
     child.stderr.on("data", (chunk: Buffer) => {
       const space = input.max_response_bytes - stderrLen;
       if (space <= 0) return;
+      let accepted: Buffer;
       if (chunk.length <= space) {
+        accepted = chunk;
         stderrChunks.push(chunk);
         stderrLen += chunk.length;
       } else {
-        stderrChunks.push(Buffer.from(chunk.subarray(0, space)));
+        accepted = Buffer.from(chunk.subarray(0, space));
+        stderrChunks.push(accepted);
         stderrLen += space;
       }
+      if (input.onStderr) input.onStderr(accepted);
     });
 
     child.on("error", (err) => {

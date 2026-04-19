@@ -276,3 +276,55 @@ Either `0` disables that limiter. Exceeded → `429 RATE_LIMITED`.
 - First call: executes, stores response in session's in-memory cache (TTL 5min, cap 128).
 - Subsequent call with same key within TTL: returns cached response with `idempotent_hit: true`.
 - Transcript records both the original turn and the hit (both append).
+
+## SSE streaming (opt-in)
+
+`POST /sessions/:id/exec` with `Accept: text/event-stream`. Response is an SSE stream (`Content-Type: text/event-stream`) that emits events as the subprocess produces output.
+
+Event sequence:
+
+| Event | Fired | Payload |
+|---|---|---|
+| `start` | Once, at exec begin | `{ session_id, command_bytes, at }` |
+| `stdout` | Zero-or-more, per subprocess chunk | `{ chunk: "<utf-8 text>" }` (redacted) |
+| `stderr` | Zero-or-more | `{ chunk: "<utf-8 text>" }` (redacted) |
+| `done` | Exactly once at exec end | Full `ExecResponse` (same shape as non-streaming) |
+| `error` | Only on catastrophic failure (e.g. session vanished mid-stream) | `{ code, message }` |
+
+The `done` payload is always the canonical response the non-streaming path would have produced — fully redacted, aggregated preview, shape detection over the complete output. Clients needing deterministic full content should rely on `done`, not on accumulating chunks.
+
+Example:
+
+```bash
+curl -N -X POST http://localhost:8080/sessions/$SID/exec \
+  -H "accept: text/event-stream" \
+  -H "content-type: application/json" \
+  -d '{"command":"bash -c \"for i in 1 2 3; do echo $i; sleep 0.3; done\""}'
+```
+
+Output:
+```
+event: start
+data: {"session_id":"...","command_bytes":45,"at":"..."}
+
+event: stdout
+data: {"chunk":"1\n"}
+
+event: stdout
+data: {"chunk":"2\n"}
+
+event: stdout
+data: {"chunk":"3\n"}
+
+event: done
+data: {"status_line":"[exit 0]","shape":"text[6b]",...}
+```
+
+### Streaming notes
+
+- **Idempotency is NOT supported** on streaming: cached responses can't reproduce original chunk timing. Clients requesting SSE with `idempotency_key` get a fresh exec each time (key is ignored).
+- **Per-chunk redaction**: secrets that span a chunk boundary may slip through the stream; the `done` payload runs the redactor over the aggregate and is always fully scrubbed. Treat streamed chunks as advisory, `done` as authoritative.
+- **Multi-byte UTF-8**: chunks are decoded with stream-mode TextDecoder so sequences that split across Node pipe reads stay intact.
+- **Intercepts** (`cd`, `export`, `unset`): no streaming happens — only `start` and `done` events fire.
+- **Errors** (e.g. CAPABILITY_DENIED, INTERPOLATION_REJECTED): the `done` event carries the error body; no `stdout`/`stderr` chunks precede it.
+- **Rate limit / auth / drain**: apply before the stream opens. 503/401/429 responses come as JSON, not SSE.
