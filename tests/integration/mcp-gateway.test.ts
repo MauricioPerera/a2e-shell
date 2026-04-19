@@ -13,7 +13,24 @@ import * as fs from "node:fs";
 
 type RpcHandler = (method: string, params: unknown) => unknown;
 
-function startMockMcp(handler: RpcHandler, opts: { requireToken?: string } = {}): Promise<{
+/**
+ * Optional streaming handler: called instead of the sync handler when the
+ * request matches a specific method. Emits one or more messages as SSE
+ * events. Useful for testing progress notifications.
+ */
+type StreamHandler = (
+  method: string,
+  params: unknown,
+  emit: (msg: unknown) => void,
+) => Promise<unknown>;
+
+function startMockMcp(
+  handler: RpcHandler,
+  opts: {
+    requireToken?: string;
+    streamFor?: { method: string; handler: StreamHandler };
+  } = {},
+): Promise<{
   url: string;
   close(): Promise<void>;
   calls: Array<{ method: string; params: unknown; headers: Record<string, string | undefined> }>;
@@ -57,6 +74,32 @@ function startMockMcp(handler: RpcHandler, opts: { requireToken?: string } = {})
           res.end();
           return;
         }
+
+        // SSE streaming path for specific methods.
+        if (opts.streamFor && opts.streamFor.method === parsed.method) {
+          res.setHeader("content-type", "text/event-stream");
+          res.setHeader("cache-control", "no-cache");
+          res.statusCode = 200;
+          const write = (msg: unknown) => {
+            res.write(`data: ${JSON.stringify(msg)}\n\n`);
+          };
+          opts.streamFor
+            .handler(parsed.method, parsed.params, write)
+            .then((result) => {
+              write({ jsonrpc: "2.0", id: parsed.id, result });
+              res.end();
+            })
+            .catch((e) => {
+              write({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                error: { code: -32603, message: e instanceof Error ? e.message : String(e) },
+              });
+              res.end();
+            });
+          return;
+        }
+
         try {
           const result = handler(parsed.method, parsed.params);
           res.setHeader("content-type", "application/json");
@@ -389,6 +432,115 @@ describe("MCP gateway (RFC 001 v1.1)", () => {
     const { app } = makeApp();
     const r = await app.request("/healthz");
     expect(r.headers.get("X-API-Version")).toBe(API_VERSION);
+  });
+
+  it("tools/call over SSE response with progress notifications reaches the client", async () => {
+    // Spin a second mock server configured to stream SSE for tools/call
+    // and emit two progress notifications before the final response.
+    const streamMock = await startMockMcp(
+      (method) => {
+        if (method === "initialize") {
+          return {
+            protocolVersion: "2025-06-18",
+            capabilities: { tools: { listChanged: false } },
+          };
+        }
+        if (method === "tools/list") {
+          return {
+            tools: [
+              {
+                name: "long_task",
+                description: "emits progress",
+                inputSchema: { type: "object", properties: {}, required: [] },
+              },
+            ],
+          };
+        }
+        if (method === "resources/list") return { resources: [] };
+        if (method === "prompts/list") return { prompts: [] };
+        throw new Error(`unhandled sync method: ${method}`);
+      },
+      {
+        streamFor: {
+          method: "tools/call",
+          handler: async (_method, params, emit) => {
+            const meta = (params as { _meta?: { progressToken?: string } })._meta;
+            const token = meta?.progressToken ?? null;
+            emit({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken: token, progress: 1, total: 3, message: "step 1" },
+            });
+            emit({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken: token, progress: 2, total: 3, message: "step 2" },
+            });
+            return {
+              content: [{ type: "text", text: "task complete" }],
+              isError: false,
+            };
+          },
+        },
+      },
+    );
+    try {
+      const { app } = makeApp();
+      const create = await app.request("/sessions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          mcp_servers: [{ id: "stream", url: streamMock.url, transport: "sse" }],
+        }),
+      });
+      expect(create.status).toBe(201);
+      const { session_id } = (await create.json()) as { session_id: string };
+
+      // Invoke via SSE exec to receive progress events.
+      const execR = await app.request(`/sessions/${session_id}/exec`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          command: "/bin/mcp-invoke stream long_task {}",
+        }),
+      });
+      expect(execR.status).toBe(200);
+      expect(execR.headers.get("content-type") ?? "").toMatch(/event-stream/);
+
+      const text = await execR.text();
+      // Events we expect in order: start, progress, progress, done.
+      const events = text
+        .split("\n\n")
+        .filter((block) => block.trim().length > 0)
+        .map((block) => {
+          const evLine = block.split("\n").find((l) => l.startsWith("event:"));
+          const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
+          return {
+            event: evLine?.slice(6).trim() ?? "",
+            data: dataLine?.slice(5).trim() ?? "",
+          };
+        });
+      const types = events.map((e) => e.event);
+      expect(types).toContain("start");
+      expect(types).toContain("progress");
+      expect(types.filter((t) => t === "progress").length).toBeGreaterThanOrEqual(2);
+      expect(types).toContain("done");
+
+      // Progress payload should carry the MCP notification method + params.
+      const firstProgress = events.find((e) => e.event === "progress");
+      const parsed = JSON.parse(firstProgress!.data) as {
+        method: string;
+        params: { progress: number; message: string };
+      };
+      expect(parsed.method).toBe("notifications/progress");
+      expect(parsed.params.progress).toBe(1);
+      expect(parsed.params.message).toBe("step 1");
+    } finally {
+      await streamMock.close();
+    }
   });
 
   it("missing auth env var fails session create with MCP_AUTH_FAILED", async () => {

@@ -42,9 +42,17 @@ describe("McpServerSpec", () => {
     ).toThrow();
   });
 
-  it("rejects non-http transport in rc.1", () => {
+  it("accepts sse transport in rc.3", () => {
+    const r = McpServerSpec.parse({ id: "gh", url: "https://example.com/mcp", transport: "sse" });
+    expect(r.transport).toBe("sse");
+  });
+
+  it("rejects unknown transports", () => {
     expect(() =>
-      McpServerSpec.parse({ id: "gh", url: "https://example.com/mcp", transport: "sse" }),
+      McpServerSpec.parse({ id: "gh", url: "https://example.com/mcp", transport: "stdio" }),
+    ).toThrow();
+    expect(() =>
+      McpServerSpec.parse({ id: "gh", url: "https://example.com/mcp", transport: "websocket" }),
     ).toThrow();
   });
 });

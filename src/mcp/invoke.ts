@@ -18,7 +18,7 @@ import type { ExecRequest, ExecResponse } from "../io/protocol.js";
 import type { ResolvedPolicy } from "../capabilities/policy.js";
 import type { Binding } from "../exec/interpolate.js";
 import type { Redactor } from "../credentials/redactor.js";
-import type { McpClient } from "./client.js";
+import type { McpClient, McpNotificationListener } from "./client.js";
 import type {
   McpCallToolResult,
   McpGetPromptResult,
@@ -36,6 +36,13 @@ export interface InvokeContext {
   policy: ResolvedPolicy;
   redactor: Redactor;
   req: ExecRequest;
+  /**
+   * Optional sink for MCP notifications that arrive during an in-flight
+   * tools/call. Only populated when the caller is streaming (SSE exec).
+   * For JSON exec the callback is undefined and notifications are
+   * silently dropped (no one is listening).
+   */
+  onNotification?: McpNotificationListener;
 }
 
 export type InvokeOutcome =
@@ -66,14 +73,14 @@ function matchesPrefix(s: string, prefix: string): boolean {
 // --- public handler --------------------------------------------------------
 
 export async function handleMcpInvoke(ctx: InvokeContext): Promise<InvokeOutcome> {
-  const { mcpClients, policy, redactor, req } = ctx;
+  const { mcpClients, policy, redactor, req, onNotification } = ctx;
   const verb = detectVerb(req.command);
   if (!verb) return { kind: "pass" };
 
   try {
     if (verb === "invoke") {
       const parsed = parseInvoke(req.command);
-      return await invokeTool(parsed, mcpClients, policy, redactor, req);
+      return await invokeTool(parsed, mcpClients, policy, redactor, req, onNotification);
     }
     if (verb === "read") {
       const parsed = parseRead(req.command);
@@ -104,6 +111,7 @@ async function invokeTool(
   policy: ResolvedPolicy,
   redactor: Redactor,
   req: ExecRequest,
+  onNotification?: McpNotificationListener,
 ): Promise<InvokeOutcome> {
   const client = clients.get(parsed.server);
   if (!client) {
@@ -115,7 +123,11 @@ async function invokeTool(
       ),
     };
   }
-  const result = await client.callTool(parsed.tool, parsed.args);
+  const result = await client.callTool(
+    parsed.tool,
+    parsed.args,
+    onNotification ? { onNotification } : undefined,
+  );
   return buildToolResponse(result, policy, redactor, req);
 }
 

@@ -131,6 +131,15 @@ async function streamExecSSE(
           queue.push({ event: "stderr", data: JSON.stringify({ chunk: text }) });
           void drain();
         },
+        // RFC 001 v1.1-rc.3 — forward MCP notifications (progress, logging)
+        // arriving during in-flight tools/call to the exec SSE stream. The
+        // event shape is the raw MCP notification: { method, params }.
+        // Consumers that don't recognize "progress" events should ignore them
+        // per the SSE spec.
+        onMcpNotification: (notification) => {
+          queue.push({ event: "progress", data: JSON.stringify(notification) });
+          void drain();
+        },
       };
 
       const res = await executeTurn(session, req, sink);

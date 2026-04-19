@@ -21,7 +21,9 @@ import { A2EError } from "../errors.js";
 import { logger } from "../logging/logger.js";
 import type { Redactor } from "../credentials/redactor.js";
 import type { McpServerSpec } from "./schema.js";
+import { parseSseStream } from "./sse.js";
 import type {
+  JsonRpcNotification,
   JsonRpcRequest,
   JsonRpcResponse,
   McpCallToolResult,
@@ -38,9 +40,27 @@ const PROTOCOL_VERSION = "2025-06-18";
 const CLIENT_NAME = "a2e-shell";
 const CLIENT_VERSION = "1.1.0-rc.1";
 
+/**
+ * Notifications observed during an in-flight request (typically
+ * `notifications/progress`, `notifications/message`). Non-fatal — the
+ * client forwards them to an optional listener and keeps waiting for the
+ * matching response id.
+ */
+export interface McpNotificationListener {
+  (notification: { method: string; params?: unknown }): void;
+}
+
+export interface McpCallToolOptions {
+  readonly onNotification?: McpNotificationListener;
+}
+
 export interface McpClient {
   readonly state: McpServerState;
-  callTool(name: string, args: Record<string, unknown>): Promise<McpCallToolResult>;
+  callTool(
+    name: string,
+    args: Record<string, unknown>,
+    opts?: McpCallToolOptions,
+  ): Promise<McpCallToolResult>;
   readResource(uri: string): Promise<readonly McpResourceContents[]>;
   getPrompt(name: string, args: Record<string, unknown>): Promise<McpGetPromptResult>;
   close(): void;
@@ -70,10 +90,21 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
 
   let nextRequestId = 1;
 
-  async function rpc<T>(method: string, params?: unknown): Promise<T> {
+  interface RpcOptions {
+    /** Extra fields to merge into request.params._meta — used for progressToken. */
+    meta?: Record<string, unknown>;
+    /** Callback for notifications arriving before the matching response. */
+    onNotification?: McpNotificationListener;
+  }
+
+  async function rpc<T>(method: string, params?: unknown, opts?: RpcOptions): Promise<T> {
     const id = nextRequestId++;
     const body: JsonRpcRequest = { jsonrpc: "2.0", id, method };
-    if (params !== undefined) (body as { params: unknown }).params = params;
+    if (params !== undefined || opts?.meta) {
+      const p: Record<string, unknown> = (params as Record<string, unknown>) ?? {};
+      if (opts?.meta) p["_meta"] = { ...((p["_meta"] as Record<string, unknown>) ?? {}), ...opts.meta };
+      (body as { params: unknown }).params = p;
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), spec.timeout_ms);
@@ -85,6 +116,7 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
         method: "POST",
         headers: {
           "content-type": "application/json",
+          // Announce that we accept both response formats (MCP Streamable HTTP).
           accept: "application/json, text/event-stream",
           ...authHeaders,
         },
@@ -105,11 +137,10 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
         `mcp '${spec.id}' network error: ${redactMessage(msg, redactor)}`,
         503,
       );
-    } finally {
-      clearTimeout(timer);
     }
 
     if (res.status === 401 || res.status === 403) {
+      clearTimeout(timer);
       throw new A2EError(
         "MCP_AUTH_FAILED",
         `mcp '${spec.id}' auth rejected (http ${res.status})`,
@@ -117,6 +148,7 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       );
     }
     if (!res.ok) {
+      clearTimeout(timer);
       throw new A2EError(
         "MCP_SERVER_UNREACHABLE",
         `mcp '${spec.id}' http ${res.status}`,
@@ -124,18 +156,34 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       );
     }
 
-    // Some MCP servers speak chunked event-stream even on request/response
-    // flows. For rc.1 we require JSON response; event-stream is rc.2 scope.
-    const text = await res.text();
+    // Branch on response Content-Type. Streamable HTTP servers may pick
+    // either application/json or text/event-stream per request.
+    const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
     let parsed: unknown;
     try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new A2EError(
-        "MCP_PROTOCOL_ERROR",
-        `mcp '${spec.id}' ${method}: non-JSON response`,
-      );
+      if (contentType.includes("text/event-stream")) {
+        if (!res.body) {
+          throw new A2EError(
+            "MCP_PROTOCOL_ERROR",
+            `mcp '${spec.id}' ${method}: empty SSE stream`,
+          );
+        }
+        parsed = await consumeSseForResponse(res.body, id, opts?.onNotification);
+      } else {
+        const text = await res.text();
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new A2EError(
+            "MCP_PROTOCOL_ERROR",
+            `mcp '${spec.id}' ${method}: non-JSON response`,
+          );
+        }
+      }
+    } finally {
+      clearTimeout(timer);
     }
+
     if (!isJsonRpcResponse(parsed)) {
       throw new A2EError(
         "MCP_PROTOCOL_ERROR",
@@ -149,6 +197,7 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       method,
       duration_ms: Date.now() - started,
       has_error: "error" in response,
+      transport: contentType.includes("text/event-stream") ? "sse" : "json",
     });
 
     if ("error" in response) {
@@ -158,6 +207,41 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       );
     }
     return response.result;
+  }
+
+  /**
+   * Pulls events from an SSE stream until we encounter the response
+   * matching `expectedId`. Notifications (messages without `id`) are
+   * forwarded to the optional listener. Returns the raw parsed message
+   * so the caller can shape-check it.
+   */
+  async function consumeSseForResponse(
+    body: ReadableStream<Uint8Array>,
+    expectedId: number,
+    onNotification?: McpNotificationListener,
+  ): Promise<unknown> {
+    for await (const message of parseSseStream(body)) {
+      if (!isJsonRpcResponse(message)) continue; // ignore garbage events
+
+      const m = message as { id?: number | string; method?: string; params?: unknown };
+      // Matching response
+      if (m.id !== undefined && m.id === expectedId) return message;
+      // Notification (no id, has method) — forward
+      if (m.id === undefined && typeof m.method === "string") {
+        if (onNotification) {
+          try {
+            onNotification({ method: m.method, params: m.params });
+          } catch {
+            /* swallow listener errors; protocol must continue */
+          }
+        }
+      }
+      // Other messages (responses to other requests, unknown shapes) ignored
+    }
+    throw new A2EError(
+      "MCP_PROTOCOL_ERROR",
+      `mcp '${spec.id}' SSE stream closed without response for id ${expectedId}`,
+    );
   }
 
   // --- handshake -----------------------------------------------------------
@@ -239,17 +323,24 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
 
   return {
     state,
-    async callTool(name, args) {
+    async callTool(name, args, opts) {
       if (!tools.has(name)) {
         throw new A2EError(
           "MCP_TOOL_NOT_FOUND",
           `mcp '${spec.id}' has no tool '${name}'`,
         );
       }
-      const result = await rpc<McpCallToolResult>("tools/call", {
-        name,
-        arguments: args,
-      });
+      // If the caller supplied a notification listener, mint a progressToken
+      // and inject it in the request's _meta. The MCP spec: any server that
+      // supports progress reports uses this token on its notifications so
+      // the client can correlate them to the in-flight request.
+      const rpcOpts: { meta?: Record<string, unknown>; onNotification?: McpNotificationListener } = {};
+      if (opts?.onNotification) {
+        const progressToken = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        rpcOpts.meta = { progressToken };
+        rpcOpts.onNotification = opts.onNotification;
+      }
+      const result = await rpc<McpCallToolResult>("tools/call", { name, arguments: args }, rpcOpts);
       if (!result.content || !Array.isArray(result.content)) {
         throw new A2EError(
           "MCP_PROTOCOL_ERROR",

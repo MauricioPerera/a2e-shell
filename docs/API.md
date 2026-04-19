@@ -345,6 +345,7 @@ Event sequence:
 | `start` | Once, at exec begin | `{ session_id, command_bytes, at }` |
 | `stdout` | Zero-or-more, per subprocess chunk | `{ chunk: "<utf-8 text>" }` (redacted) |
 | `stderr` | Zero-or-more | `{ chunk: "<utf-8 text>" }` (redacted) |
+| `progress` | Zero-or-more (v1.1+) | MCP notification passthrough: `{ method: "notifications/progress", params: {...} }`. Only fires when the command is an MCP invocation (`/bin/mcp-invoke`) and the MCP server streams progress during the call. |
 | `done` | Exactly once at exec end | Full `ExecResponse` (same shape as non-streaming) |
 | `error` | Only on catastrophic failure (e.g. session vanished mid-stream) | `{ code, message }` |
 

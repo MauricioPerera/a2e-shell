@@ -6,6 +6,43 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.1.0-rc.3] - 2026-04-19
+
+Third release candidate for v1.1. Adds SSE response handling + progress notification relay. Completes the read-side MCP primitive surface planned for v1.1.
+
+### Added
+
+- **SSE response mode on MCP tools/call**: when an MCP server responds with `Content-Type: text/event-stream` (per MCP Streamable HTTP), a2e-shell parses the event stream, correlates the response to its request id, and forwards any interleaved notifications to a listener. Servers that stream progress during long-running tool calls now work end-to-end.
+- **`transport: "sse"` in `McpServerSpec`**: explicitly opt a server into SSE response mode. Functionally identical to `"http"` on the client side (both accept `application/json` + `text/event-stream`); the flag is documentation for the operator + guard against non-MCP servers.
+- **Progress notification relay**: when an exec is streamed via SSE (`Accept: text/event-stream` on `POST /exec`) AND the command is `/bin/mcp-invoke`, any `notifications/progress`, `notifications/message`, etc. from the MCP server are forwarded as `event: progress` SSE messages. Payload shape: `{ method: "notifications/progress", params: { progressToken, progress, total?, message? } }`.
+- **`progressToken` injection**: `callTool` mints a short random token and places it under `params._meta.progressToken` when a notification listener is supplied. Servers that honor MCP's progress contract use the token on their notifications so the client can correlate them to the in-flight request.
+- **`src/mcp/sse.ts`**: minimal SSE parser (~120 lines). Handles LF-LF and CRLF-CRLF event boundaries, comment lines, multi-line ignored fields, invalid-JSON tolerance, and partial trailing events.
+
+### Changed
+
+- **`ExecSink` gains `onMcpNotification?`**: invoked by the pipeline when an MCP tool call is in flight under a streaming exec. Non-MCP execs never invoke this. Non-streaming execs (JSON response) pass `undefined` and notifications are silently dropped (no listener).
+- **`McpClient.callTool` signature**: now accepts an optional third arg `{ onNotification?: (n: { method, params }) => void }`. Backward compatible — existing rc.1/rc.2 callers pass nothing and behavior is unchanged.
+- **exec SSE contract**: the existing `start` / `stdout` / `stderr` / `done` / `error` events are now joined by `progress`. Clients that don't recognize the new event type should ignore it per SSE semantics.
+
+### Deferred
+
+- **stdio transport** for MCP (rc.4 / v1.2). Requires subprocess lifecycle management at session create/delete; orthogonal to the HTTP/SSE path.
+- **Server-initiated long-lived GET stream** (spec's `GET <url>` listening channel for notifications outside an in-flight request). Deferred until there's a concrete use case; the POST-response SSE path already covers the progress scenario.
+- **`Mcp-Session-Id` header threading** for resumable sessions (stateful MCP servers). Deferred.
+- **Multi-server benchmark vs Claude Desktop** (v1.1.0 final).
+
+### Tests
+
+9 new tests: 7 unit tests for the SSE parser (LF/CRLF boundaries, comments, invalid JSON tolerance, partial tails), 1 schema test for `transport: "sse"`, 1 integration test spinning a mock server that streams progress and asserting the full event sequence (start → progress ×2 → done) reaches the a2e-shell SSE client.
+
+Full suite: 180/180 green (up from 171 in rc.2).
+
+### Backwards compatibility
+
+Fully additive. Existing rc.1 / rc.2 sessions and clients work unchanged. The new `progress` event type is opt-in (only emitted when the exec is streamed AND the command is an MCP invocation).
+
+---
+
 ## [1.1.0-rc.2] - 2026-04-19
 
 Second release candidate for v1.1. Adds `resources/*` and `prompts/*` MCP primitives to the gateway. `tools/*` surface from rc.1 unchanged.
@@ -192,6 +229,7 @@ Initial release. HTTP server exposing a real OS shell as a primitive tool for LL
 - Transcript as append-only audit log. Replay endpoint computing an integrity hash.
 - Default capability surface via Dockerfile: `curl`, `jq`, `gh`, `aws-cli`, `kubectl`, `git`, `grep`, `sed`, `gawk`, `ripgrep`.
 
+[1.1.0-rc.3]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.3
 [1.1.0-rc.2]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.2
 [1.1.0-rc.1]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.1
 [1.0.0-rc.3]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.3

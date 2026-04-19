@@ -38,6 +38,13 @@ interface TurnResult {
 export interface ExecSink {
   onStdout?(text: string): void;
   onStderr?(text: string): void;
+  /**
+   * Called when the current exec is an MCP tools/call and the upstream
+   * server emits `notifications/progress` or similar messages while the
+   * call is in flight. Non-MCP execs never invoke this. Non-streaming
+   * execs (JSON response) don't provide this callback.
+   */
+  onMcpNotification?(notification: { method: string; params?: unknown }): void;
 }
 
 export async function executeTurn(
@@ -104,6 +111,11 @@ async function runTurn(
       policy: session.policy,
       redactor: session.redactor,
       req: { ...req, command: interpolated },
+      // Only forward notifications when the caller is streaming — otherwise
+      // there's no one to receive them between the request and its response.
+      ...(sink?.onMcpNotification
+        ? { onNotification: (n) => sink.onMcpNotification!(n) }
+        : {}),
     });
     if (result.kind === "handled") {
       // Capture binding if provided and the call succeeded.

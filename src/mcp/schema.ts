@@ -36,8 +36,15 @@ export const McpServerSpec = z
      * Must be [a-z][a-z0-9_-]{0,31} so it's safe in shell tokens.
      */
     id: z.string().regex(ID_RE, "id must be a short lowercase identifier"),
-    /** Transport. v1.1-rc.1 only supports http. */
-    transport: z.literal("http").default("http"),
+    /**
+     * Transport. Accepted values (rc.3):
+     *   "http" — classic request/response; server returns application/json
+     *   "sse"  — Streamable HTTP; server MAY return text/event-stream on a per-request basis
+     * From the client's perspective the only real difference is whether we
+     * announce the intent to accept event-stream responses. Any server that
+     * speaks the MCP 2025-06-18 Streamable HTTP transport accepts either.
+     */
+    transport: z.enum(["http", "sse"]).default("http"),
     /** Absolute URL of the MCP endpoint. */
     url: z.string().url("url must be absolute"),
     auth: McpAuthSpec.optional(),
