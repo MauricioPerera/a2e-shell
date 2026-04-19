@@ -1,0 +1,5 @@
+{"_meta":{"name":"capability-denied","mode":"unrestricted","replay":"deterministic","capabilities":{"binaries_allowlist":["curl","jq"],"http_domains_allowlist":["*"],"max_exec_timeout_ms":5000}}}
+{"t":1,"req":{"command":"rm -rf /tmp/foo"},"res":{"status_line":"[error: CAPABILITY_DENIED]","shape":null,"preview":null,"binding":null,"error":{"code":"CAPABILITY_DENIED","message":"binary 'rm' not in allowlist"}}}
+{"t":2,"req":{"command":"aws s3 ls"},"res":{"status_line":"[error: CAPABILITY_DENIED]","shape":null,"preview":null,"binding":null,"error":{"code":"CAPABILITY_DENIED","message":"binary 'aws' not in allowlist"}}}
+{"t":3,"req":{"command":"curl -sS https://example.com"},"res":{"status_line":"[exit 0]","shape":"text[<=2048B]","preview":"<html>...</html>","binding":null}}
+{"t":4,"req":{"op":"state_final"},"res":{"cwd":"<session_cwd>","bindings":{},"env_overlay_keys":[]}}

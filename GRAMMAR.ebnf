@@ -1,0 +1,235 @@
+(* =============================================================
+   a2e-shell — gramática formal canónica
+   Versión: 0.1
+   Target: LLM como único consumidor.
+   Invariantes:
+     - No Turing-completa.
+     - No eval, no expresiones aritméticas arbitrarias.
+     - Interpolación ${...} restringida a paths sobre scope.
+     - Cualquier extensión exige modificar este archivo PRIMERO.
+   Convenciones EBNF:
+     - "lit"       terminal literal (case-sensitive salvo http-method)
+     - A | B       alternativa
+     - [ A ]       opcional
+     - { A }       cero o más
+     - ( A )       agrupación
+     - SP          whitespace obligatorio (uno o más espacios/tabs)
+     - NL          newline
+   ============================================================= *)
+
+(* ---------- Programa ---------- *)
+
+program           = { line } ;
+line              = [ stmt ] NL ;
+stmt              = assignment | command ;
+assignment        = variable SP "=" SP command ;
+
+command           = verb-call | meta-call | block ;
+
+(* ---------- Verbos core (8) ---------- *)
+
+verb-call         = call-cmd
+                  | filter-cmd
+                  | transform-cmd
+                  | save-cmd
+                  | wait-cmd
+                  | merge-cmd ;
+
+(* if y foreach son bloques, están en §Bloques *)
+
+(* call = HTTP o CLI según primer token *)
+call-cmd          = "call" SP ( http-call | cli-call ) ;
+http-call         = http-method SP url [ SP http-options ] ;
+http-method       = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" ;
+http-options      = http-option { SP http-option } ;
+http-option       = header-flag | body-flag | query-flag | timeout-flag ;
+header-flag       = "--header" SP string ;           (* "Name: value" *)
+body-flag         = "--body"   SP value ;
+query-flag        = "--query"  SP string ;           (* "k=v&k2=v2" *)
+timeout-flag      = "--timeout" SP duration ;
+url               = string | interpolated-string ;
+
+cli-call          = binary-name { SP cli-arg } ;
+binary-name       = identifier ;                     (* validado contra allowlist en runtime *)
+cli-arg           = value | cli-flag ;
+cli-flag          = "--" identifier [ ( "=" | SP ) value ]
+                  | "-" letter [ SP value ] ;
+
+filter-cmd        = "filter" SP value SP "where" SP predicate ;
+transform-cmd     = "transform" SP value SP transform-op ;
+transform-op      = "pick" SP field-list
+                  | "omit" SP field-list
+                  | "rename" SP rename-list
+                  | "set"    SP set-list
+                  | "map"    SP object-literal ;
+field-list        = identifier { "," SP identifier } ;
+rename-list       = rename-pair { "," SP rename-pair } ;
+rename-pair       = identifier "=" identifier ;
+set-list          = set-pair { "," SP set-pair } ;
+set-pair          = identifier "=" value ;
+
+save-cmd          = "save" SP value SP "as" SP identifier [ SP save-flag ] ;
+save-flag         = "--ttl" SP duration | "--overwrite" ;
+
+wait-cmd          = "wait" SP duration ;
+
+merge-cmd         = "merge" SP value SP value SP "by" SP field-path
+                    [ SP "--strategy" SP merge-strategy ] ;
+merge-strategy    = "inner" | "left" | "right" | "outer" ;
+
+(* ---------- Bloques (if, foreach) ---------- *)
+
+block             = if-block | foreach-block ;
+
+if-block          = "if" SP predicate SP "do" NL
+                    { line }
+                    [ "else" NL { line } ]
+                    "end" ;
+
+foreach-block     = "foreach" SP variable SP "in" SP value
+                    [ SP foreach-flag ]
+                    SP "do" NL
+                    { line }
+                    "end" ;
+foreach-flag      = "--parallel" "=" integer            (* cap aplicado en runtime *)
+                  | "--on-error" "=" ( "abort" | "continue" ) ;
+
+(* ---------- Meta-comandos (6) ---------- *)
+
+meta-call         = describe-cmd | head-cmd | show-cmd
+                  | env-cmd | history-cmd | help-cmd ;
+
+describe-cmd      = "describe" SP value ;
+head-cmd          = "head" SP value [ SP integer ] ;    (* default 5 *)
+show-cmd          = "show" SP value ;                   (* único dump completo *)
+env-cmd           = "env" ;
+history-cmd       = "history" [ SP integer ] ;          (* últimas N, default 10 *)
+help-cmd          = "help" [ SP identifier ] ;
+
+(* ---------- Predicados (DSL acotado) ---------- *)
+
+predicate         = predicate-or ;
+predicate-or      = predicate-and { SP "or"  SP predicate-and } ;
+predicate-and     = predicate-not { SP "and" SP predicate-not } ;
+predicate-not     = [ "not" SP ] predicate-atom ;
+predicate-atom    = comparison
+                  | membership
+                  | match-pred
+                  | existence
+                  | "(" predicate ")" ;
+
+comparison        = operand SP comparator SP operand ;
+comparator        = "==" | "!=" | ">" | ">=" | "<" | "<=" ;
+
+membership        = operand SP "in" SP list-literal ;
+match-pred        = operand SP "matches" SP string ;     (* regex ECMA, sin backreferences *)
+existence         = operand SP "exists" ;
+
+operand           = field-path | value ;
+field-path        = "." identifier { "." identifier | "[" integer "]" } ;
+
+(* ---------- Valores y literales ---------- *)
+
+value             = literal
+                  | variable
+                  | path
+                  | interpolated-string ;
+
+literal           = string | number | boolean | null | list-literal | object-literal | duration ;
+
+string            = '"' { string-char } '"' ;
+interpolated-string = '"' { string-char | interpolation } '"' ;
+string-char       = ? cualquier unicode excepto '"' y '\' ? | escape ;
+escape            = "\\" ( '"' | "\\" | "n" | "t" | "r" | "u" hex hex hex hex ) ;
+interpolation     = "${" path "}" ;                      (* SOLO paths, nunca expresiones *)
+
+number            = [ "-" ] digit { digit } [ "." digit { digit } ] ;
+boolean           = "true" | "false" ;
+null              = "null" ;
+
+list-literal      = "[" [ value { "," SP value } ] "]" ;
+object-literal    = "{" [ object-pair { "," SP object-pair } ] "}" ;
+object-pair       = identifier ":" SP value ;
+
+duration          = digit { digit } duration-unit ;
+duration-unit     = "ms" | "s" | "m" | "h" | "d" ;
+
+(* ---------- Variables y paths ---------- *)
+
+variable          = "$" ( identifier | "_" ) ;
+path              = variable { "." identifier | "[" integer "]" } ;
+
+(* ---------- Identificadores ---------- *)
+
+identifier        = letter { letter | digit | "_" | "-" } ;
+letter            = "a" | ... | "z" | "A" | ... | "Z" ;
+digit             = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+hex               = digit | "a"..."f" | "A"..."F" ;
+integer           = digit { digit } ;
+
+(* ---------- Whitespace ---------- *)
+
+SP                = ( " " | "\t" ) { " " | "\t" } ;
+NL                = "\n" | "\r\n" ;
+
+(* =============================================================
+   REGLAS DE CONFORMANCIA (obligatorias para el parser)
+   =============================================================
+
+   R1. UN COMANDO POR LÍNEA.
+       `assignment` y `command` no pueden compartir línea.
+       Los bloques (`if`, `foreach`) cubren múltiples líneas
+       delimitadas por `do` / `end`.
+
+   R2. INTERPOLACIÓN RESTRINGIDA.
+       Dentro de ${...} el parser acepta ÚNICAMENTE la producción
+       `path`. Operadores, llamadas, ternarios, aritmética, espacios
+       internos o strings dentro → INTERPOLATION_REJECTED.
+       Regex permitida (tokenizer): ^\$[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_-]*|\[[0-9]+\])*$
+
+   R3. ALLOWLIST DE BINARIOS.
+       `binary-name` es sintácticamente válido, pero el ejecutor
+       rechaza con CAPABILITY_DENIED si no está en
+       `capabilities.ts:ALLOWED_BINARIES`.
+
+   R4. HTTP vs CLI EN `call`.
+       El parser distingue por lookahead de 1 token:
+       si primer token post-`call` ∈ {GET,POST,PUT,PATCH,DELETE,HEAD}
+       → rama http-call. En caso contrario → rama cli-call.
+       Los métodos son case-sensitive uppercase; `get` es CLI.
+
+   R5. NOMBRES DE VARIABLE RESERVADOS.
+       `$_` es únicamente binding implícito del último resultado.
+       Asignar a `$_` explícitamente es SCOPE_MISS.
+
+   R6. BLOQUES NO ANIDAN `assignment` DE BLOQUE.
+       `foreach $x in $y do ($z = foreach ... end) end` es
+       sintácticamente inválido: un bloque no puede ser el lado
+       derecho de un assignment. Los bloques producen efectos en
+       scope, no valor asignable directamente. (Para capturar valor
+       de un foreach, el cuerpo usa `save` o muta una variable
+       de scope externo vía assignment de verbo no-bloque.)
+
+   R7. LÍMITES DURUOS APLICADOS POR PARSER.
+       - MAX_LINE_LENGTH = 4096 chars → PARSE_ERROR
+       - MAX_BLOCK_DEPTH = 4          → PARSE_ERROR
+       - MAX_COMMANDS_PER_TURN = 64   → PARSE_ERROR
+
+   R8. SUGERENCIAS EN PARSE_ERROR.
+       Si token inesperado tiene Levenshtein ≤ 2 a un terminal
+       reservado (verbo, meta, flag conocida, keyword), el error
+       incluye `suggestion`. Caso contrario, sin suggestion.
+
+   R9. REGEX EN `matches`.
+       Sintaxis ECMA-262 estricta, SIN:
+         - backreferences (\1, \2, ...)
+         - lookbehind variable
+         - named groups con captura compleja
+       Timeout de match = 100ms. Exceso → PARSE_ERROR con
+       `code: REGEX_TIMEOUT` al ejecutar, no al parsear.
+
+   R10. DURACIÓN MÁXIMA.
+        Un `duration` literal > 3600000 ms (1h) es sintácticamente
+        válido pero el verbo `wait` lo rechaza en ejecución con
+        CAPABILITY_DENIED si excede la quota de la sesión.
+*)

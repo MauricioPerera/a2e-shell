@@ -1,0 +1,5 @@
+{"_meta":{"name":"interpolation-rejected","mode":"unrestricted","replay":"deterministic","capabilities":{"binaries_allowlist":["curl","jq","echo"],"http_domains_allowlist":["*"],"max_exec_timeout_ms":5000}}}
+{"t":1,"req":{"command":"echo '{\"user\":{\"id\":42,\"name\":\"lee\"}}' ","bind_as":"data"},"res":{"status_line":"[exit 0]","shape":"json<object>[1]","preview":"{\"user\":{\"id\":42,\"name\":\"lee\"}}","binding":"$data"}}
+{"t":2,"req":{"command":"echo ${$data.user.id}"},"res":{"status_line":"[error: INTERPOLATION_REJECTED]","shape":null,"preview":null,"binding":null,"error":{"code":"INTERPOLATION_REJECTED","message":"interpolation accepts only bare '${$var}'; got '${$data.user.id}'"}}}
+{"t":3,"req":{"command":"echo ${$data} | jq '.user.id'"},"res":{"status_line":"[exit 0]","shape":"text[3B]","preview":"42\n","binding":null}}
+{"t":4,"req":{"command":"echo ${$missing}"},"res":{"status_line":"[error: SCOPE_MISS]","shape":null,"preview":null,"binding":null,"error":{"code":"SCOPE_MISS","message":"binding '$missing' not defined"}}}

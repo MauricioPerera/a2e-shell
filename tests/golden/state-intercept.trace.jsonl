@@ -1,0 +1,9 @@
+{"_meta":{"name":"state-intercept","mode":"unrestricted","replay":"deterministic","capabilities":{"binaries_allowlist":["pwd","echo","cat"],"max_exec_timeout_ms":3000}}}
+{"t":1,"req":{"command":"pwd"},"res":{"status_line":"[exit 0]","shape":"text[<=128B]","preview":"<session_cwd>\n","binding":null}}
+{"t":2,"req":{"command":"cd /tmp"},"res":{"status_line":"[exit 0]","shape":null,"preview":null,"binding":null,"_intercept":"cd"}}
+{"t":3,"req":{"command":"pwd"},"res":{"status_line":"[exit 0]","shape":"text[5B]","preview":"/tmp\n","binding":null}}
+{"t":4,"req":{"command":"export FOO=bar"},"res":{"status_line":"[exit 0]","shape":null,"preview":null,"binding":null,"_intercept":"export"}}
+{"t":5,"req":{"command":"echo $FOO"},"res":{"status_line":"[exit 0]","shape":"text[4B]","preview":"bar\n","binding":null}}
+{"t":6,"req":{"command":"unset FOO"},"res":{"status_line":"[exit 0]","shape":null,"preview":null,"binding":null,"_intercept":"unset"}}
+{"t":7,"req":{"command":"echo \"[$FOO]\""},"res":{"status_line":"[exit 0]","shape":"text[3B]","preview":"[]\n","binding":null}}
+{"t":8,"req":{"op":"state_final"},"res":{"cwd":"/tmp","bindings":{},"env_overlay_keys":[]}}

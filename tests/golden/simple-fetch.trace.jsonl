@@ -1,0 +1,4 @@
+{"_meta":{"name":"simple-fetch","mode":"unrestricted","replay":"deterministic","capabilities":{"binaries_allowlist":["curl","jq"],"http_domains_allowlist":["api.github.com"],"max_exec_timeout_ms":10000,"max_response_bytes":65536}}}
+{"t":1,"req":{"command":"curl -sS https://api.github.com/zen","bind_as":"zen","timeout_ms":5000},"res":{"status_line":"[exit 0]","shape":"text[42B]","preview":"Approachable is better than simple.","binding":"$zen"}}
+{"t":2,"req":{"command":"echo ${$zen} | wc -c"},"res":{"status_line":"[exit 0]","shape":"text[3B]","preview":"43\n","binding":null}}
+{"t":3,"req":{"command":"env","op":"state_final"},"res":{"cwd":"<session_cwd>","bindings":{"$zen":{"shape":"text[42B]","size_bytes":42}},"env_overlay_keys":[]}}
