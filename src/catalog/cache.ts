@@ -22,6 +22,8 @@ import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { A2EError } from "../errors.js";
 import type { Redactor } from "../credentials/redactor.js";
+import { logger } from "../logging/logger.js";
+import { catalogMirrorEvents, catalogMirrorsActive } from "../metrics/metrics.js";
 
 const SHA_RE = /^[a-f0-9]{40}$/;
 
@@ -74,15 +76,25 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
     // Returns true if the mirror existed before this call (cache hit).
     const existed = fs.existsSync(mirrorPath);
     if (!existed) {
+      const cloneStart = Date.now();
       fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
       const cloneArgs = [...authArgs, "clone", "--bare"];
       if (cfg.filterBlobs) cloneArgs.push("--filter=blob:none");
       cloneArgs.push(repoUrl, mirrorPath);
       await runGit(cloneArgs, timeoutMs, undefined, redactor, authEnv);
       await markRefreshed(mirrorPath);
+      catalogMirrorEvents.inc({ event: "created" });
+      catalogMirrorsActive.inc();
+      logger.info({
+        event: "catalog.mirror.created",
+        mirror_path: mirrorPath,
+        duration_ms: Date.now() - cloneStart,
+        filter_blobs: cfg.filterBlobs,
+      });
       return false;
     }
     if (await needsRefresh(mirrorPath, cfg.refreshSeconds)) {
+      const refreshStart = Date.now();
       await runGit(
         [...authArgs, "remote", "update", "--prune"],
         timeoutMs,
@@ -91,6 +103,12 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
         authEnv,
       );
       await markRefreshed(mirrorPath);
+      catalogMirrorEvents.inc({ event: "refreshed" });
+      logger.info({
+        event: "catalog.mirror.refreshed",
+        mirror_path: mirrorPath,
+        duration_ms: Date.now() - refreshStart,
+      });
     }
     return true;
   }

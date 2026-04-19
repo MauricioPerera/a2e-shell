@@ -14,6 +14,8 @@ import { A2EError } from "../errors.js";
 import { bootstrapCatalog } from "../catalog/bootstrap.js";
 import type { CatalogCache } from "../catalog/cache.js";
 import type { CatalogInfo, CreateSessionRequest } from "../io/protocol.js";
+import { logger } from "../logging/logger.js";
+import { sessionsActive, sessionLifecycle } from "../metrics/metrics.js";
 
 export interface ManagerConfig {
   readonly sessionsDir: string;
@@ -77,6 +79,7 @@ export function createManager(cfg: ManagerConfig): SessionManager {
 
       let catalog: CatalogInfo | null = null;
       if (req.catalog) {
+        const bootstrapStart = Date.now();
         try {
           catalog = await bootstrapCatalog({
             spec: req.catalog,
@@ -86,11 +89,26 @@ export function createManager(cfg: ManagerConfig): SessionManager {
             redactor,
             cache: cfg.catalogCache,
           });
+          logger.info({
+            event: "catalog.bootstrap.ok",
+            session_id: id,
+            duration_ms: Date.now() - bootstrapStart,
+            index_sha: catalog.index_sha,
+            content_sha: catalog.content_sha,
+            in_sync: catalog.in_sync,
+          });
         } catch (e) {
           // Bootstrap left partial worktrees / clone artifacts on disk. Wipe
           // them so a retry is clean and so we don't leak disk for failed
           // sessions that never reached the in-memory registry.
           await fsp.rm(path.join(cfg.sessionsDir, id), { recursive: true, force: true }).catch(() => {});
+          sessionLifecycle.inc({ event: "bootstrap_failed" });
+          logger.warn({
+            event: "catalog.bootstrap.failed",
+            session_id: id,
+            duration_ms: Date.now() - bootstrapStart,
+            code: e instanceof A2EError ? e.code : "INTERNAL",
+          });
           throw e;
         }
       }
@@ -106,6 +124,15 @@ export function createManager(cfg: ManagerConfig): SessionManager {
         catalog,
       });
       sessions.set(id, session);
+      sessionsActive.set(sessions.size);
+      sessionLifecycle.inc({ event: "created" });
+      logger.info({
+        event: "session.created",
+        session_id: id,
+        mode: policy.mode,
+        has_catalog: catalog !== null,
+        expires_at: expires_at.toISOString(),
+      });
       return session;
     },
 
@@ -114,6 +141,9 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       if (!s) throw new A2EError("NOT_FOUND", `session '${id}' not found`, 404);
       if (s.expiresAt.getTime() < Date.now()) {
         sessions.delete(id);
+        sessionsActive.set(sessions.size);
+        sessionLifecycle.inc({ event: "expired" });
+        logger.info({ event: "session.expired", session_id: id });
         void removeSessionDir(cfg.sessionsDir, id);
         void pruneWorktrees(s.catalog?.mirror_path ?? null);
         throw new A2EError("CONFLICT", `session '${id}' expired`, 409);
@@ -125,6 +155,9 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       const s = sessions.get(id);
       const existed = sessions.delete(id);
       if (existed && s) {
+        sessionsActive.set(sessions.size);
+        sessionLifecycle.inc({ event: "deleted" });
+        logger.info({ event: "session.deleted", session_id: id });
         // Synchronous disk cleanup so 204 is an honest "all gone". The git
         // worktree prune is still fire-and-forget since it only touches metadata.
         await removeSessionDir(cfg.sessionsDir, id);
@@ -142,10 +175,15 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       for (const [id, s] of sessions) {
         if (s.expiresAt.getTime() < now.getTime()) {
           sessions.delete(id);
+          sessionLifecycle.inc({ event: "expired" });
           void removeSessionDir(cfg.sessionsDir, id);
           void pruneWorktrees(s.catalog?.mirror_path ?? null);
           n++;
         }
+      }
+      if (n > 0) {
+        sessionsActive.set(sessions.size);
+        logger.info({ event: "session.sweep", expired_count: n });
       }
       return n;
     },

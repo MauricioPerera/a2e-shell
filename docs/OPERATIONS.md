@@ -15,6 +15,7 @@ Environment variables, deployment modes, Dockerfile, and capability configuratio
 | `A2E_RATE_LIMIT_PER_MINUTE` | `120` | Per-session cap on `/sessions/:id` and `/sessions/:id/*`; `0` = disabled |
 | `A2E_RATE_LIMIT_CREATE_PER_MINUTE` | `20` | Cap on `POST /sessions` (keyed by bearer token, else `anon`); `0` = disabled |
 | `A2E_ALLOWED_CWD_PREFIXES` | `<sessionsDir>` | Comma-separated absolute prefixes allowed for `initial_cwd` / PATCH cwd. Empty env = default (sessionsDir only) |
+| `A2E_LOG_LEVEL` | `info` | Pino log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
 
 ### Credential redaction
 
@@ -177,9 +178,37 @@ Don't just raise `timeout_ms`. Split the work: `head`-limit the input, paginate 
 
 ## Observability
 
-v1 has no structured logs or metrics. `request_id` (uuid) is in every error response and in response header `X-Request-Id` — useful for correlation if you add a logger (planned v2).
+### Structured logs
 
-`GET /sessions/:id/transcript` is the per-session audit. `GET /sessions/:id/state` for snapshot.
+JSON lines on stdout via `pino`. Every request, session lifecycle event, exec, and catalog mirror operation emits a structured event with `request_id`, `session_id`, `duration_ms`, and a stable `event` field (`http.request`, `session.created`, `session.deleted`, `session.expired`, `exec`, `catalog.bootstrap.ok`, `catalog.bootstrap.failed`, `catalog.mirror.created`, `catalog.mirror.refreshed`, `http.error`, `http.error.unhandled`, `server.listening`).
+
+Config: `A2E_LOG_LEVEL=trace|debug|info|warn|error|fatal` (default `info`).
+
+The logger has an internal redaction list for common secret-shaped keys (`authorization`, `token`, `password`, `*.token`, etc.) as a defense-in-depth measure. The primary credential redactor is `A2E_REDACT_ENV_KEYS`, which covers subprocess output and HTTP error messages.
+
+### Prometheus metrics
+
+`GET /metrics` (unauthenticated; place behind a reverse-proxy if restricted) exposes:
+
+| Metric | Type | Labels | Purpose |
+|---|---|---|---|
+| `a2e_http_requests_total` | counter | `route`, `status` | HTTP request volume by route template |
+| `a2e_http_request_duration_ms` | histogram | `route` | End-to-end HTTP latency |
+| `a2e_sessions_active` | gauge | — | Currently-registered sessions |
+| `a2e_sessions_total` | counter | `event` = created/deleted/expired/bootstrap_failed | Session lifecycle volume |
+| `a2e_exec_duration_ms` | histogram | — | Exec turn duration (includes pipeline overhead) |
+| `a2e_exec_total` | counter | `outcome` = ok/error/intercept | Exec outcomes |
+| `a2e_errors_total` | counter | `code` | Error responses by error code |
+| `a2e_catalog_mirrors_active` | gauge | — | Active catalog mirrors in cache |
+| `a2e_catalog_mirror_events_total` | counter | `event` = created/refreshed/pruned | Mirror lifecycle volume |
+| `a2e_rate_limit_hits_total` | counter | `bucket` = session/create | Rate-limit rejection volume |
+| `a2e_redactor_secrets_count` | gauge | — | Secrets loaded into server-level redactor |
+
+Plus default Node process metrics (heap, event-loop lag, file descriptors) from `prom-client`.
+
+### Correlation
+
+`request_id` (uuid) is in every log line, in every HTTP error response body, and in the response header `X-Request-Id`. Per-session audit is `GET /sessions/:id/transcript` (JSONL); per-session snapshot is `GET /sessions/:id/state`.
 
 ## Cleanup and lifecycle
 

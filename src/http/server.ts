@@ -4,6 +4,15 @@ import { HTTPException } from "hono/http-exception";
 import * as crypto from "node:crypto";
 import { A2EError, httpStatusForCode, type ErrorCode } from "../errors.js";
 import { buildRedactor, type Redactor } from "../credentials/redactor.js";
+import { logger } from "../logging/logger.js";
+import {
+  registry as metricsRegistry,
+  httpRequests,
+  httpDurationMs,
+  errorsTotal,
+  rateLimitHits,
+  redactorSecrets,
+} from "../metrics/metrics.js";
 import type { SessionManager } from "../session/manager.js";
 import { mountSessions } from "./routes/sessions.js";
 import { mountExec } from "./routes/exec.js";
@@ -37,8 +46,10 @@ export function buildApp(deps: ServerDeps): Hono<AppEnv> {
   // covering any credential-bearing substrings that an A2EError might carry
   // (e.g. when message is built from git stderr during bootstrap).
   const serverRedactor = buildRedactor(deps.config.redactEnvKeys, process.env);
+  redactorSecrets.set(serverRedactor.secrets.length);
 
   app.use("*", requestId());
+  app.use("*", observability());
   app.use("*", bodyLimit(deps.config.maxRequestBytes));
   app.use("/sessions/*", auth(deps.config.authTokens));
   app.use("/sessions", auth(deps.config.authTokens));
@@ -64,16 +75,36 @@ export function buildApp(deps: ServerDeps): Hono<AppEnv> {
   app.onError((err, c) => {
     const rid = c.get("request_id") ?? "unknown";
     if (err instanceof A2EError) {
+      errorsTotal.inc({ code: err.code });
+      logger.warn({
+        event: "http.error",
+        request_id: rid,
+        code: err.code,
+        http_status: err.httpStatus,
+      });
       return jsonError(c, err.code, redactMessage(err.message, serverRedactor), rid, err.httpStatus);
     }
     if (err instanceof HTTPException) {
       const code: ErrorCode = err.status === 404 ? "NOT_FOUND" : "INTERNAL";
+      errorsTotal.inc({ code });
+      logger.warn({ event: "http.error", request_id: rid, code, http_status: err.status });
       return jsonError(c, code, undefined, rid, err.status);
     }
+    errorsTotal.inc({ code: "INTERNAL" });
+    logger.error({
+      event: "http.error.unhandled",
+      request_id: rid,
+      err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+    });
     return jsonError(c, "INTERNAL", undefined, rid, 500);
   });
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  app.get("/metrics", async (c) => {
+    const body = await metricsRegistry.metrics();
+    return c.text(body, 200, { "Content-Type": metricsRegistry.contentType });
+  });
 
   mountSessions(app, deps.manager);
   mountExec(app, deps.manager);
@@ -100,6 +131,34 @@ function requestId(): MiddlewareHandler<AppEnv> {
     c.set("request_id", rid);
     c.header("X-Request-Id", rid);
     await next();
+  };
+}
+
+/**
+ * Observability middleware: logs request start/end with timing and status,
+ * records HTTP metrics. Route label uses the Hono match pattern (e.g.
+ * "/sessions/:id/exec") so cardinality stays bounded.
+ */
+function observability(): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    const start = Date.now();
+    const method = c.req.method;
+    const path = c.req.path;
+    await next();
+    const duration = Date.now() - start;
+    const status = c.res.status;
+    const route = (c.req.routePath || path).replace(/^\//, "").split("/").slice(0, 4).join("/");
+    const routeLabel = `${method} /${route}`;
+    httpRequests.inc({ route: routeLabel, status: String(status) });
+    httpDurationMs.observe({ route: routeLabel }, duration);
+    logger.info({
+      event: "http.request",
+      request_id: c.get("request_id"),
+      method,
+      path,
+      status,
+      duration_ms: duration,
+    });
   };
 }
 
@@ -151,6 +210,8 @@ function rateLimit(
     } else {
       existing.count++;
       if (existing.count > perMinute) {
+        const bucket = key.startsWith("create:") ? "create" : "session";
+        rateLimitHits.inc({ bucket });
         throw new A2EError(
           "RATE_LIMITED",
           `rate limit exceeded for '${key}' (${perMinute}/min)`,

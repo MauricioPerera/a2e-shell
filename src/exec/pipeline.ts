@@ -12,10 +12,48 @@ import { format, detectShape } from "../io/format.js";
 import type { Session } from "../session/state.js";
 import type { ExecRequest, ExecResponse } from "../io/protocol.js";
 import type { Binding } from "./interpolate.js";
+import { logger } from "../logging/logger.js";
+import { execDurationMs, execTotal, errorsTotal } from "../metrics/metrics.js";
 import * as path from "node:path";
 import * as fsp from "node:fs/promises";
 
 export async function executeTurn(
+  session: Session,
+  req: ExecRequest,
+): Promise<ExecResponse> {
+  const start = Date.now();
+  try {
+    const result = await runTurn(session, req);
+    const isError = result.error !== undefined;
+    const isIntercept = result.status_line === "[exit 0]" && result.shape === null && result.preview === null;
+    const outcome = isError ? "error" : isIntercept ? "intercept" : "ok";
+    execTotal.inc({ outcome });
+    if (isError && result.error) errorsTotal.inc({ code: result.error.code });
+    execDurationMs.observe(Date.now() - start);
+    logger.info({
+      event: "exec",
+      session_id: session.id,
+      outcome,
+      duration_ms: Date.now() - start,
+      command_bytes: req.command.length,
+      has_bind: req.bind_as !== undefined,
+      has_idempotency_key: req.idempotency_key !== undefined,
+      ...(isError && result.error ? { error_code: result.error.code } : {}),
+      ...(result.truncated ? { truncated: true } : {}),
+    });
+    return result;
+  } catch (e) {
+    // Defense in depth: runTurn wraps every branch in errorResponse, but if
+    // something truly exceptional slips through, classify and surface.
+    execTotal.inc({ outcome: "error" });
+    execDurationMs.observe(Date.now() - start);
+    const res = errorResponse(e);
+    if (res.error) errorsTotal.inc({ code: res.error.code });
+    return res;
+  }
+}
+
+async function runTurn(
   session: Session,
   req: ExecRequest,
 ): Promise<ExecResponse> {

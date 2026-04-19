@@ -3,6 +3,7 @@ import { serve } from "@hono/node-server";
 import { buildApp } from "./http/server.js";
 import { createManager } from "./session/manager.js";
 import { createCatalogCache } from "./catalog/cache.js";
+import { logger } from "./logging/logger.js";
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -48,3 +49,12 @@ setInterval(() => manager.sweepExpired(), 60_000).unref();
 const app = buildApp({ manager, config });
 
 serve({ fetch: app.fetch, port: config.port });
+logger.info({
+  event: "server.listening",
+  port: config.port,
+  auth_enabled: config.authTokens.length > 0,
+  rate_limit_per_minute: config.rateLimitPerMinute,
+  rate_limit_create_per_minute: config.rateLimitCreatePerMinute,
+  redact_keys_count: config.redactEnvKeys.length,
+  sessions_dir: sessionsDir,
+});
