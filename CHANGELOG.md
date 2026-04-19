@@ -6,6 +6,17 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.0.0-rc.3] - 2026-04-19
+
+### Fixed
+- **Schema lock gap**: `SERVICE_UNAVAILABLE` / HTTP 503 (emitted by the drain gate during graceful shutdown) was missing from [docs/API.md](docs/API.md)'s HTTP codes table and error codes inventory. Clients validating strictly against the v1.0 contract would have rejected legitimate 503 responses. Contract now matches code.
+- **Persistence was fire-and-forget**: `session.markDirty()` kicked off `runFlush()` without awaiting, and mutation routes returned HTTP 200 before the disk write completed. A crash between the response and the async write silently dropped the turn from `POST /resume`'s view. Every mutating route (`POST /exec`, its SSE variant, idempotent-hit replay, `PATCH /cwd`, `PATCH /env`) now `await`s `session.flush()` before responding. `manager.create()` also forces an initial `state.json` via new `session.touchForPersistence()` + flush so a crash right after `POST /sessions` 201 doesn't leave the client with an unresumable session id. Noops when persistence is off (default).
+
+### Notes
+- Third-round internal review surfaced 8 candidate findings; 2 were real (above), 6 were verified false positives and not applied. See commit [12836df](https://github.com/MauricioPerera/a2e-shell/commit/12836df) for the full triage.
+
+---
+
 ## [1.0.0-rc.2] - 2026-04-19
 
 ### Added
@@ -110,6 +121,7 @@ Initial release. HTTP server exposing a real OS shell as a primitive tool for LL
 - Transcript as append-only audit log. Replay endpoint computing an integrity hash.
 - Default capability surface via Dockerfile: `curl`, `jq`, `gh`, `aws-cli`, `kubectl`, `git`, `grep`, `sed`, `gawk`, `ripgrep`.
 
+[1.0.0-rc.3]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.1
 [0.3.0]: https://github.com/MauricioPerera/a2e-shell/compare/0a4b85a...0f6aae3
