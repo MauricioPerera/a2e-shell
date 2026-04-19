@@ -34,6 +34,8 @@ const catalogCache = createCatalogCache({
   cacheDir: process.env.A2E_CATALOG_CACHE_DIR ?? path.join(sessionsDir, ".catalog-cache"),
   refreshSeconds: envInt("A2E_CATALOG_CACHE_REFRESH_S", 60),
   filterBlobs: (process.env.A2E_CATALOG_CACHE_FILTER_BLOBS ?? "true") !== "false",
+  maxBytes: envInt("A2E_CATALOG_CACHE_MAX_BYTES", 2 * 1024 * 1024 * 1024), // 2 GiB
+  sweepIntervalSeconds: envInt("A2E_CATALOG_CACHE_SWEEP_INTERVAL_S", 300), // 5 min
 });
 
 const manager = createManager({

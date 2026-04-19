@@ -51,6 +51,8 @@ All can be overridden per-session via the `capabilities` request field.
 | `A2E_CATALOG_CACHE_DIR` | `<A2E_SESSIONS_DIR>/.catalog-cache` | Where bare mirrors live |
 | `A2E_CATALOG_CACHE_REFRESH_S` | `60` | Branch/tag refetch interval. SHA refs never refresh |
 | `A2E_CATALOG_CACHE_FILTER_BLOBS` | `true` | Apply `--filter=blob:none` to mirror clones. HTTPS-only benefit; file:// ignores |
+| `A2E_CATALOG_CACHE_MAX_BYTES` | `2147483648` (2 GiB) | Soft cap for the cache directory. LRU sweep evicts idle mirrors over this size. `0` = unbounded |
+| `A2E_CATALOG_CACHE_SWEEP_INTERVAL_S` | `300` | Background sweep interval for worktree-prune + LRU eviction. `0` disables |
 | `A2E_CATALOG_BOOTSTRAP_TIMEOUT_MS` | `60000` | Per-git-operation timeout during session bootstrap |
 
 ### Subprocess runtime
@@ -214,7 +216,7 @@ Plus default Node process metrics (heap, event-loop lag, file descriptors) from 
 
 - **DELETE** is synchronous for disk cleanup (session dir removed before 204 returns). Worktree prune on the mirror is fire-and-forget.
 - **Expired sessions** are swept every 60s by a background interval. Same cleanup behavior.
-- **Cache mirror** never shrinks in v1 — no LRU eviction. Monitor `A2E_CATALOG_CACHE_DIR` disk usage and prune manually for long-running hosts (safe to `rm -rf` any `<repo-hash>/` subdir; next session will re-clone).
+- **Cache mirror** is LRU-swept every `A2E_CATALOG_CACHE_SWEEP_INTERVAL_S` (default 5 min): `git worktree prune` runs on every mirror, then mirrors without live worktrees are evicted oldest-first until total disk is under `A2E_CATALOG_CACHE_MAX_BYTES` (default 2 GiB). Mirrors with active worktrees are never evicted. Setting `maxBytes=0` disables eviction entirely (unbounded growth — prune only).
 - **Session directories** that escape cleanup (process crash mid-session) persist until manually removed. `A2E_SESSIONS_DIR` should be on a volume you can wipe on redeploy.
 
 ## Hardening checklist for production

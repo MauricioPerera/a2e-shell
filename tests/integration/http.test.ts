@@ -13,7 +13,7 @@ function makeApp(opts?: {
 }) {
   const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), "http-"));
   const catalogCache = createCatalogCache({
-    enabled: false, cacheDir: path.join(sessionsDir, ".cache"), refreshSeconds: 3600, filterBlobs: false,
+    enabled: false, cacheDir: path.join(sessionsDir, ".cache"), refreshSeconds: 3600, filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
   });
   const manager = createManager({
     sessionsDir,

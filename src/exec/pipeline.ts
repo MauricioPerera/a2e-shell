@@ -155,9 +155,10 @@ async function applyIntercept(
 ): Promise<ExecResponse> {
   try {
     if (mutation.type === "cd") {
-      const target = path.isAbsolute(mutation.path)
-        ? mutation.path
-        : path.resolve(session.getCwd(), mutation.path);
+      const expanded = expandHome(mutation.path, session);
+      const target = path.isAbsolute(expanded)
+        ? expanded
+        : path.resolve(session.getCwd(), expanded);
       try {
         const st = await fsp.stat(target);
         if (!st.isDirectory()) {
@@ -188,6 +189,22 @@ async function applyIntercept(
     preview_bytes_limit: session.policy.preview_bytes,
     stderr_bytes_limit: session.policy.stderr_preview_bytes,
   });
+}
+
+/**
+ * Expand a leading `~` or `~/...` in a cd target. Uses the session's env
+ * overlay HOME first (so `export HOME=/custom` takes effect), then falls back
+ * to the server process env. No-op for paths that don't start with `~`.
+ */
+function expandHome(p: string, session: Session): string {
+  if (p === "~") {
+    return session.getEnvOverlay().HOME ?? process.env.HOME ?? p;
+  }
+  if (p.startsWith("~/")) {
+    const home = session.getEnvOverlay().HOME ?? process.env.HOME;
+    if (home) return path.join(home, p.slice(2));
+  }
+  return p;
 }
 
 function buildSubprocessEnv(session: Session): Record<string, string> {

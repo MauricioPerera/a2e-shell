@@ -38,7 +38,7 @@ describe("createCatalogCache (shared-mirror mode)", () => {
       enabled: true,
       cacheDir: path.join(base, "cache"),
       refreshSeconds: 3600,
-      filterBlobs: false,
+      filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
     });
 
     const t1 = path.join(base, "s1");
@@ -67,7 +67,7 @@ describe("createCatalogCache (shared-mirror mode)", () => {
       enabled: true,
       cacheDir: path.join(base, "cache"),
       refreshSeconds: 3600,
-      filterBlobs: false,
+      filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
     });
 
     const t = path.join(base, "s1");
@@ -85,7 +85,7 @@ describe("createCatalogCache (shared-mirror mode)", () => {
       enabled: true,
       cacheDir: path.join(base, "cache"),
       refreshSeconds: 3600,
-      filterBlobs: false,
+      filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
     });
 
     const [r1, r2, r3] = await Promise.all([
@@ -106,7 +106,7 @@ describe("createCatalogCache (shared-mirror mode)", () => {
       enabled: true,
       cacheDir: path.join(base, "cache"),
       refreshSeconds: 3600,
-      filterBlobs: true,
+      filterBlobs: true, maxBytes: 0, sweepIntervalSeconds: 0,
     });
 
     const t = path.join(base, "s1");
@@ -129,6 +129,50 @@ describe("createCatalogCache (shared-mirror mode)", () => {
     expect(fs.readFileSync(path.join(t, "a.txt"), "utf8")).toBe("hello\n");
   });
 
+  it("sweep: evicts idle mirrors when total exceeds maxBytes", async () => {
+    const { url } = makeBareRepo(base);
+    const cache = createCatalogCache({
+      enabled: true,
+      cacheDir: path.join(base, "cache"),
+      refreshSeconds: 3600,
+      filterBlobs: false,
+      maxBytes: 1, // force eviction
+      sweepIntervalSeconds: 0,
+    });
+    const wt = path.join(base, "s1");
+    await cache.materialize({
+      repo_url: url, ref: "main", target_dir: wt,
+      authArgs: [], authEnv: {}, timeoutMs: 30_000, redactor,
+    });
+    // Remove worktree so the mirror becomes evictable.
+    fs.rmSync(wt, { recursive: true, force: true });
+
+    const r = await cache.sweep();
+    expect(r.mirrors_evicted).toBeGreaterThan(0);
+    expect(r.total_bytes_after).toBeLessThan(r.total_bytes_before);
+    cache.shutdown();
+  });
+
+  it("sweep: does NOT evict mirrors with live worktrees", async () => {
+    const { url } = makeBareRepo(base);
+    const cache = createCatalogCache({
+      enabled: true,
+      cacheDir: path.join(base, "cache"),
+      refreshSeconds: 3600,
+      filterBlobs: false,
+      maxBytes: 1,
+      sweepIntervalSeconds: 0,
+    });
+    const wt = path.join(base, "s1");
+    await cache.materialize({
+      repo_url: url, ref: "main", target_dir: wt,
+      authArgs: [], authEnv: {}, timeoutMs: 30_000, redactor,
+    });
+    const r = await cache.sweep();
+    expect(r.mirrors_evicted).toBe(0);
+    cache.shutdown();
+  });
+
   it("disabled mode produces no mirror", async () => {
     const { url, sha } = makeBareRepo(base);
     const cacheDir = path.join(base, "cache");
@@ -136,7 +180,7 @@ describe("createCatalogCache (shared-mirror mode)", () => {
       enabled: false,
       cacheDir,
       refreshSeconds: 3600,
-      filterBlobs: false,
+      filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
     });
 
     const t = path.join(base, "s1");

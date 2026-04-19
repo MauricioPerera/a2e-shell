@@ -87,7 +87,10 @@ export async function run(input: RunInput): Promise<RunResult> {
         stdoutChunks.push(chunk);
         stdoutLen += chunk.length;
       } else {
-        stdoutChunks.push(chunk.subarray(0, space));
+        // Defensive copy: subarray shares memory with the source Buffer. If
+        // any downstream consumer (redactor, formatter) were to mutate bytes,
+        // the original pool could surface stale data. Buffer.from clones.
+        stdoutChunks.push(Buffer.from(chunk.subarray(0, space)));
         stdoutLen += space;
         truncated = true;
       }
@@ -100,7 +103,7 @@ export async function run(input: RunInput): Promise<RunResult> {
         stderrChunks.push(chunk);
         stderrLen += chunk.length;
       } else {
-        stderrChunks.push(chunk.subarray(0, space));
+        stderrChunks.push(Buffer.from(chunk.subarray(0, space)));
         stderrLen += space;
       }
     });

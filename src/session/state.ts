@@ -2,12 +2,14 @@
  * Session state — in-memory, transcript-backed for durability.
  */
 
+import * as fsp from "node:fs/promises";
 import type { ResolvedPolicy } from "../capabilities/policy.js";
 import type { Binding } from "../exec/interpolate.js";
 import type { Redactor } from "../credentials/redactor.js";
 import type { CatalogInfo, ExecResponse } from "../io/protocol.js";
 import { A2EError } from "../errors.js";
 import { isReservedEnvKey } from "./validation.js";
+import { logger } from "../logging/logger.js";
 import { openTranscript, type Transcript, type TranscriptEntry } from "./transcript.js";
 
 export interface SessionInit {
@@ -66,16 +68,40 @@ export interface Session {
 const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
 const IDEMPOTENCY_MAX_ENTRIES = 128;
 
+/**
+ * Rotate when the NEXT append would take the transcript past this fraction of
+ * its cap. Leaves headroom so the rotating append itself doesn't hit the hard
+ * cap and fail.
+ */
+const TRANSCRIPT_ROTATION_THRESHOLD = 0.8;
+
 export function createSession(init: SessionInit): Session {
   const env: Record<string, string> = { ...init.initial_env_overlay };
   const bindings = new Map<string, Binding>();
-  const transcript = openTranscript(init.transcript_path);
+  let transcript = openTranscript(init.transcript_path);
   const idempotencyCache = new Map<string, { response: ExecResponse; expires: number }>();
   const idempotencyInflight = new Map<string, Promise<ExecResponse>>();
   let cwd = init.initial_cwd;
   let historySize = 0;
   let turn = 0;
   let transcriptBytes = 0;
+
+  async function rotateTranscript(): Promise<void> {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const rotatedPath = `${init.transcript_path}.${ts}.jsonl`;
+    try {
+      await fsp.rename(init.transcript_path, rotatedPath);
+    } catch {
+      // If the current file doesn't exist yet (rare), skip rename.
+    }
+    transcript = openTranscript(init.transcript_path);
+    transcriptBytes = 0;
+    logger.info({
+      event: "transcript.rotated",
+      session_id: init.session_id,
+      rotated_to: rotatedPath,
+    });
+  }
 
   function totalBindingBytes(): number {
     let s = 0;
@@ -154,10 +180,16 @@ export function createSession(init: SessionInit): Session {
       const clean = init.redactor.redact(bytes);
       const cleanLine = new TextDecoder().decode(clean);
       const byteLen = Buffer.byteLength(cleanLine, "utf8") + 1; // +1 for newline
-      if (transcriptBytes + byteLen > init.policy.max_transcript_bytes) {
+      const softCap = Math.floor(init.policy.max_transcript_bytes * TRANSCRIPT_ROTATION_THRESHOLD);
+      // Rotate proactively when 80% full AND there's at least one entry so we
+      // don't rotate empty files when a single huge entry lands.
+      if (transcriptBytes > 0 && transcriptBytes + byteLen > softCap) {
+        await rotateTranscript();
+      }
+      if (byteLen > init.policy.max_transcript_bytes) {
         throw new A2EError(
           "SIZE_LIMIT",
-          `transcript would exceed ${init.policy.max_transcript_bytes}B; session must be rotated`,
+          `transcript entry is ${byteLen}B, larger than cap ${init.policy.max_transcript_bytes}B`,
         );
       }
       await transcript.appendRaw(cleanLine);

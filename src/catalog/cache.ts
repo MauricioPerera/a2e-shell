@@ -38,7 +38,27 @@ export interface CatalogCacheConfig {
    * Requires `uploadpack.allowFilter=true` on the server (GitHub/GitLab have it).
    */
   readonly filterBlobs: boolean;
+  /**
+   * Soft cap on the total cache directory size in bytes. The LRU sweeper runs
+   * periodically; if total exceeds the cap, it evicts idle mirrors (no active
+   * worktrees) in ascending last-access order until the total is under the cap.
+   * `0` disables LRU eviction entirely (unbounded cache).
+   */
+  readonly maxBytes: number;
+  /** Sweep interval in seconds for LRU + worktree prune. `0` disables. */
+  readonly sweepIntervalSeconds: number;
 }
+
+/** Upper-bound on git subprocess calls run from sweep tasks. */
+const SWEEP_GIT_TIMEOUT_MS = 10_000;
+/** Transient git error strings that warrant a retry in resolveSha. */
+const TRANSIENT_ERROR_PATTERNS = [
+  /ECONNRESET/i,
+  /ETIMEDOUT/i,
+  /could not read from remote/i,
+  /early EOF/i,
+  /HTTP 5\d\d/i,
+];
 
 export interface MaterializeInput {
   readonly repo_url: string;
@@ -60,6 +80,18 @@ export interface MaterializeResult {
 
 export interface CatalogCache {
   materialize(input: MaterializeInput): Promise<MaterializeResult>;
+  /** Run one LRU + prune pass. Exposed for tests and operator-triggered sweeps. */
+  sweep(): Promise<SweepResult>;
+  /** Stop background timers. Idempotent. */
+  shutdown(): void;
+}
+
+export interface SweepResult {
+  readonly total_bytes_before: number;
+  readonly total_bytes_after: number;
+  readonly mirrors_before: number;
+  readonly mirrors_evicted: number;
+  readonly mirrors_pruned: number;
 }
 
 export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
@@ -125,13 +157,17 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
       try {
         await runGit(["rev-parse", "--verify", `${ref}^{commit}`], 5_000, mirrorPath, redactor);
       } catch {
-        // SHA not reachable from mirror's refs: fetch it explicitly.
-        await runGit(
-          [...authArgs, "fetch", "--depth=1", "origin", ref],
-          timeoutMs,
-          mirrorPath,
-          redactor,
-          authEnv,
+        // SHA not reachable from mirror's refs: fetch it explicitly, with
+        // retries for transient network errors.
+        await withTransientRetry(
+          () => runGit(
+            [...authArgs, "fetch", "--depth=1", "origin", ref],
+            timeoutMs,
+            mirrorPath,
+            redactor,
+            authEnv,
+          ),
+          { op: "fetch", mirror: mirrorPath },
         );
       }
       return ref;
@@ -220,7 +256,18 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
 
     const sha = await resolveSha(mirrorPath, input.ref, input.authArgs, input.authEnv, input.timeoutMs, input.redactor);
     await addWorktree(mirrorPath, sha, input.target_dir, input.redactor);
+    await touchAccess(mirrorPath);
     return { resolved_sha: sha, used_cache: existedBefore, mirror_path: mirrorPath };
+  }
+
+  let sweepTimer: NodeJS.Timeout | null = null;
+  if (cfg.enabled && cfg.sweepIntervalSeconds > 0) {
+    sweepTimer = setInterval(() => {
+      doSweep(cfg).catch((e) => {
+        logger.warn({ event: "catalog.sweep.failed", err: String(e) });
+      });
+    }, cfg.sweepIntervalSeconds * 1000);
+    sweepTimer.unref();
   }
 
   return {
@@ -228,7 +275,213 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
       if (!cfg.enabled) return materializeDirect(input);
       return materializeViaMirror(input);
     },
+    async sweep() {
+      return cfg.enabled ? doSweep(cfg) : {
+        total_bytes_before: 0,
+        total_bytes_after: 0,
+        mirrors_before: 0,
+        mirrors_evicted: 0,
+        mirrors_pruned: 0,
+      };
+    },
+    shutdown() {
+      if (sweepTimer) {
+        clearInterval(sweepTimer);
+        sweepTimer = null;
+      }
+    },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Sweep / LRU / prune
+// ---------------------------------------------------------------------------
+
+/**
+ * One sweep pass:
+ *   1. Run `git worktree prune` on every mirror to clear stale metadata from
+ *      crashed or hard-killed sessions.
+ *   2. Measure total cache size.
+ *   3. If over cap, evict mirrors in ascending last-access order, skipping
+ *      those with live worktrees. Eviction = `rm -rf <mirror_dir>`.
+ */
+async function doSweep(cfg: CatalogCacheConfig): Promise<SweepResult> {
+  const mirrors = await listMirrors(cfg.cacheDir);
+  let pruned = 0;
+  for (const m of mirrors) {
+    if (await pruneOne(m)) pruned++;
+  }
+  const withStats = await Promise.all(
+    mirrors.map(async (m) => ({
+      path: m,
+      size: await dirSizeBytes(m).catch(() => 0),
+      lastAccess: await readLastAccess(m),
+      hasLiveWorktrees: await hasLiveWorktrees(m),
+    })),
+  );
+  const totalBefore = withStats.reduce((a, m) => a + m.size, 0);
+
+  let evicted = 0;
+  let totalAfter = totalBefore;
+  if (cfg.maxBytes > 0 && totalBefore > cfg.maxBytes) {
+    // Evict idle mirrors first, oldest access first.
+    const evictable = withStats
+      .filter((m) => !m.hasLiveWorktrees)
+      .sort((a, b) => a.lastAccess - b.lastAccess);
+    for (const m of evictable) {
+      if (totalAfter <= cfg.maxBytes) break;
+      try {
+        await fsp.rm(path.dirname(m.path), { recursive: true, force: true });
+        totalAfter -= m.size;
+        evicted++;
+        catalogMirrorsActive.dec();
+        catalogMirrorEvents.inc({ event: "pruned" });
+        logger.info({
+          event: "catalog.mirror.evicted",
+          mirror_path: m.path,
+          size_bytes: m.size,
+          last_access_ms_ago: Date.now() - m.lastAccess,
+        });
+      } catch (e) {
+        logger.warn({
+          event: "catalog.mirror.evict_failed",
+          mirror_path: m.path,
+          err: String(e),
+        });
+      }
+    }
+  }
+  if (pruned > 0 || evicted > 0) {
+    logger.info({
+      event: "catalog.sweep",
+      mirrors_before: mirrors.length,
+      mirrors_pruned: pruned,
+      mirrors_evicted: evicted,
+      total_bytes_before: totalBefore,
+      total_bytes_after: totalAfter,
+    });
+  }
+  return {
+    total_bytes_before: totalBefore,
+    total_bytes_after: totalAfter,
+    mirrors_before: mirrors.length,
+    mirrors_evicted: evicted,
+    mirrors_pruned: pruned,
+  };
+}
+
+async function listMirrors(cacheDir: string): Promise<string[]> {
+  try {
+    const entries = await fsp.readdir(cacheDir, { withFileTypes: true });
+    const out: string[] = [];
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const mirror = path.join(cacheDir, e.name, "mirror.git");
+      if (fs.existsSync(mirror)) out.push(mirror);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+async function pruneOne(mirrorPath: string): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const child = spawn("git", ["-C", mirrorPath, "worktree", "prune"], {
+      stdio: "ignore",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    const t = setTimeout(() => child.kill("SIGKILL"), SWEEP_GIT_TIMEOUT_MS);
+    child.on("close", (code) => {
+      clearTimeout(t);
+      resolve(code === 0);
+    });
+    child.on("error", () => { clearTimeout(t); resolve(false); });
+  });
+}
+
+async function hasLiveWorktrees(mirrorPath: string): Promise<boolean> {
+  const worktreesDir = path.join(mirrorPath, "worktrees");
+  try {
+    const entries = await fsp.readdir(worktreesDir);
+    // After `git worktree prune`, only live worktrees remain.
+    return entries.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function dirSizeBytes(p: string): Promise<number> {
+  let total = 0;
+  const stack: string[] = [p];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch { continue; }
+    for (const e of entries) {
+      const ep = path.join(dir, e.name);
+      if (e.isDirectory()) stack.push(ep);
+      else if (e.isFile()) {
+        try { total += (await fsp.stat(ep)).size; } catch { /* ignore */ }
+      }
+    }
+  }
+  return total;
+}
+
+async function touchAccess(mirrorPath: string): Promise<void> {
+  const marker = path.join(mirrorPath, ".a2e-last-access");
+  const now = new Date();
+  try {
+    await fsp.writeFile(marker, now.toISOString(), "utf8");
+  } catch { /* best-effort */ }
+}
+
+async function readLastAccess(mirrorPath: string): Promise<number> {
+  const marker = path.join(mirrorPath, ".a2e-last-access");
+  try {
+    const st = await fsp.stat(marker);
+    return st.mtimeMs;
+  } catch {
+    // Fall back to mirror dir mtime if access marker never got written.
+    try {
+      return (await fsp.stat(mirrorPath)).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+}
+
+async function withTransientRetry<T>(
+  op: () => Promise<T>,
+  ctx: { op: string; mirror: string },
+): Promise<T> {
+  const delays = [100, 500, 2_000];
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      return await op();
+    } catch (e) {
+      lastErr = e;
+      if (!isTransient(e) || attempt === delays.length) throw e;
+      logger.warn({
+        event: "catalog.transient_retry",
+        op: ctx.op,
+        mirror_path: ctx.mirror,
+        attempt: attempt + 1,
+        next_delay_ms: delays[attempt],
+      });
+      await new Promise((r) => setTimeout(r, delays[attempt]));
+    }
+  }
+  throw lastErr;
+}
+
+function isTransient(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return TRANSIENT_ERROR_PATTERNS.some((re) => re.test(msg));
 }
 
 async function needsRefresh(mirrorPath: string, refreshSeconds: number): Promise<boolean> {
