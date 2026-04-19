@@ -1,0 +1,221 @@
+# a2e-shell — reference Kubernetes manifest.
+#
+# Assumptions:
+#   - TLS is terminated at the ingress (ALB / nginx / Caddy). The pod speaks
+#     plain HTTP on 8080. For pod-native TLS, set A2E_TLS_* env vars from the
+#     `a2e-shell-tls` Secret (sample at the bottom) and flip the service port.
+#   - Session state lives on each pod's ephemeral disk (emptyDir). A session
+#     created on pod A cannot be served by pod B — pin affinity via the
+#     X-Worker-Id header that every response carries. The Ingress example
+#     below shows nginx-ingress sticky routing keyed on that header.
+#   - terminationGracePeriodSeconds MUST be strictly greater than
+#     A2E_GRACE_PERIOD_MS so the pod's drain window completes before SIGKILL.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: a2e-shell
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: a2e-shell-auth
+  namespace: a2e-shell
+type: Opaque
+stringData:
+  # Comma-separated bearer tokens. Rotate via a normal Secret update.
+  A2E_AUTH_TOKENS: "REPLACE_WITH_ROTATED_TOKEN"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a2e-shell-config
+  namespace: a2e-shell
+data:
+  A2E_PORT: "8080"
+  A2E_SESSIONS_DIR: "/sessions"
+  A2E_MAX_REQUEST_BYTES: "1048576"
+  A2E_RATE_LIMIT_PER_MINUTE: "120"
+  A2E_RATE_LIMIT_CREATE_PER_MINUTE: "20"
+  A2E_GRACE_PERIOD_MS: "25000"
+  A2E_LOG_LEVEL: "info"
+  A2E_SESSION_PERSISTENCE: "false"
+  A2E_REDACT_ENV_KEYS: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a2e-shell
+  namespace: a2e-shell
+  labels:
+    app: a2e-shell
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: a2e-shell
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: a2e-shell
+    spec:
+      # 25s drain + 5s buffer for post-close cleanup.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: a2e-shell
+          image: ghcr.io/mauricioperera/a2e-shell:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Worker id defaults to random UUID per pod, which is what we want:
+            # every pod gets a stable id for its lifetime, and the LB uses it
+            # for session affinity.
+            - name: A2E_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: a2e-shell-config
+            - secretRef:
+                name: a2e-shell-auth
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # node needs /tmp + /app for tsx/ESM
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sessions
+              mountPath: /sessions
+      volumes:
+        - name: sessions
+          emptyDir:
+            sizeLimit: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: a2e-shell
+  namespace: a2e-shell
+spec:
+  type: ClusterIP
+  selector:
+    app: a2e-shell
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: a2e-shell
+  namespace: a2e-shell
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: a2e-shell
+---
+# Ingress example for nginx-ingress with session affinity on X-Worker-Id.
+# The response header "X-Worker-Id" identifies which pod served a session;
+# subsequent requests for that session must route to the same pod. The
+# session-cookie approach here works if clients propagate cookies; for
+# stateless HTTP clients, terminate TLS at an L7 LB that supports
+# header-based affinity (e.g. Envoy/Istio VirtualService with a hashPolicy
+# keyed on the X-A2E-Session header your client sends).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: a2e-shell
+  namespace: a2e-shell
+  annotations:
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "a2e_affinity"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"          # SSE streaming
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["a2e.example.com"]
+      secretName: a2e-shell-ingress-tls
+  rules:
+    - host: a2e.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: a2e-shell
+                port:
+                  name: http
+---
+# HorizontalPodAutoscaler — scale on CPU. Session affinity means scale-up only
+# helps new sessions; existing ones stay pinned to their pod.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: a2e-shell
+  namespace: a2e-shell
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: a2e-shell
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# ----------------------------------------------------------------------------
+# OPTIONAL: pod-native TLS (skip the ingress TLS above). Create the Secret:
+#   kubectl create secret tls a2e-shell-tls --cert=fullchain.pem --key=privkey.pem -n a2e-shell
+# then add to the Deployment's container spec:
+#   volumeMounts:
+#     - { name: tls, mountPath: /tls, readOnly: true }
+#   env:
+#     - { name: A2E_TLS_CERT_PATH, value: /tls/tls.crt }
+#     - { name: A2E_TLS_KEY_PATH,  value: /tls/tls.key }
+# and to the Pod spec:
+#   volumes:
+#     - name: tls
+#       secret: { secretName: a2e-shell-tls }

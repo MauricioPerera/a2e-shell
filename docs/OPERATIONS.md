@@ -77,6 +77,16 @@ All can be overridden per-session via the `capabilities` request field.
 
 ## Deployment
 
+### Reference templates
+
+Ready-to-adapt manifests live under [deploy/](../deploy/):
+
+- `deploy/kubernetes/a2e-shell.yaml` — Deployment, Service, Ingress (nginx with sticky cookie + SSE-friendly timeouts), HPA, PDB.
+- `deploy/docker-compose.yml` — Single-host VM with Traefik TLS termination via Let's Encrypt.
+- `deploy/terraform/aws/` — Terraform module for ECS Fargate + ALB (sticky cookie) + EFS for `/sessions`.
+
+Read `deploy/README.md` before deploying: it documents the non-negotiables (session affinity, termination grace, buffering-off for SSE, secret handling) that every template encodes but that are easy to miss if you adapt them.
+
 ### Docker (recommended)
 
 The shipped [Dockerfile](../Dockerfile) produces a Debian-slim image with Node 22 and a base CLI set (`curl`, `jq`, `gh`, `aws-cli`, `kubectl`, `git`, `grep`, `sed`, `gawk`, `ripgrep`). Runs as non-root UID 10001.
