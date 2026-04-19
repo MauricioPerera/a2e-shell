@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { ERROR_CODES } from "../errors.js";
+import { McpServersArray } from "../mcp/schema.js";
+export { McpServerSpec, McpAuthSpec, McpServersArray } from "../mcp/schema.js";
 
 export const SessionMode = z.enum(["unrestricted", "bounded"]);
 export type SessionMode = z.infer<typeof SessionMode>;
@@ -65,6 +67,8 @@ export const CreateSessionRequest = z
     initial_cwd: z.string().optional(),
     initial_env: z.record(z.string(), z.string()).optional(),
     catalog: CatalogSpec.optional(),
+    // RFC 001 v1.1 — MCP gateway (inbound). Optional; v1.0 sessions are unchanged.
+    mcp_servers: McpServersArray.optional(),
   })
   .strict();
 export type CreateSessionRequest = z.infer<typeof CreateSessionRequest>;
@@ -94,6 +98,23 @@ export const CatalogInfo = z
   .strict();
 export type CatalogInfo = z.infer<typeof CatalogInfo>;
 
+export const McpServerInfo = z
+  .object({
+    id: z.string(),
+    url: z.string(),
+    protocol_version: z.string(),
+    tools_count: z.number().int().nonnegative(),
+    server_info: z
+      .object({
+        name: z.string().optional(),
+        version: z.string().optional(),
+      })
+      .passthrough()
+      .nullable(),
+  })
+  .strict();
+export type McpServerInfo = z.infer<typeof McpServerInfo>;
+
 export const CreateSessionResponse = z
   .object({
     session_id: z.string().uuid(),
@@ -101,6 +122,8 @@ export const CreateSessionResponse = z
     cwd: z.string(),
     expires_at: z.string().datetime(),
     catalog: CatalogInfo.nullable(),
+    // RFC 001 v1.1 — MCP gateway status. Empty array when no servers configured.
+    mcp_servers: z.array(McpServerInfo).default([]),
   })
   .strict();
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponse>;

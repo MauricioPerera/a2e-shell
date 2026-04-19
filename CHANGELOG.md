@@ -6,6 +6,38 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.1.0-rc.1] - 2026-04-19
+
+First release candidate for v1.1 — MCP gateway (inbound). Implements [RFC 001](docs/rfcs/001-mcp-gateway.md) rc.1 scope.
+
+### Added
+
+- **MCP gateway**: `POST /sessions` now accepts an optional `mcp_servers` array. At session creation, a2e-shell connects to each server, performs the `initialize` handshake, and caches the server's `tools/list` response. Auth via env-var-named tokens (same discipline as catalog auth — token value never inlined, never logged, always redacted).
+- **`/bin/mcp-invoke` virtual command**: the agent invokes MCP tools via `exec` with `command: "/bin/mcp-invoke <server-id> <tool-name> <args-json>"`. The pipeline intercepts this pattern BEFORE state-intercept and BEFORE binary allowlist enforcement, routes the call to the right MCP client, wraps the result in the canonical response format (status_line + shape + preview + binding + stderr + truncated), and records it in the transcript identically to bash exec.
+- **Canonical response over MCP**: token-efficient response shape applies to MCP tool outputs too. Large JSON responses are previewed (2KB) + shape-detected; `bind_as` captures the full payload under `$var` for cross-turn reference. Same 32–164× token savings measured on bash outputs transfer directly to MCP outputs.
+- **MCP tools in reachability**: when a catalog is mounted AND MCP servers are connected, a2e-shell writes `<index_dir>/mcp-tools.json` containing every connected tool's schema. The agent sees them alongside git-backed skills via `$A2E_CATALOG_REACHABILITY`.
+- **New error codes**: `MCP_SERVER_UNREACHABLE` (503), `MCP_AUTH_FAILED` (401), `MCP_TOOL_NOT_FOUND` (200 inside ExecResponse.error), `MCP_PROTOCOL_ERROR` (200), `MCP_TIMEOUT` (200).
+- **New fields on `CreateSessionResponse`**: `mcp_servers` array with per-server `{id, url, protocol_version, tools_count, server_info}`.
+- **Redaction**: MCP auth env var values join the session redactor pipeline; any echo in stderr, protocol error message, or transcript entry is scrubbed.
+
+### Deferred to later rc's
+
+- SSE transport (rc.2), stdio transport (rc.3 or v1.2)
+- `resources/*` + `prompts/*` primitives (rc.2)
+- Progress notification relay (rc.2)
+- `sampling/createMessage`, `elicitation/create`, `roots/list` (out of v1.1 scope)
+- `resources/subscribe` + live invalidation (v1.2)
+
+### Backwards compatibility
+
+Fully additive. Sessions without `mcp_servers` behave identically to v1.0.0-rc.3. `CreateSessionResponse` gains a required `mcp_servers` field (defaults to `[]` when no servers configured) — clients deserializing with strict schemas may need to accept the new field.
+
+### Tests
+
+27 new tests covering the parser, schema, client handshake, tool invocation, auth failures, and canonical response wrapping. Total suite: 160/160 green on Linux + Windows.
+
+---
+
 ## [1.0.0-rc.3] - 2026-04-19
 
 ### Fixed
@@ -121,6 +153,7 @@ Initial release. HTTP server exposing a real OS shell as a primitive tool for LL
 - Transcript as append-only audit log. Replay endpoint computing an integrity hash.
 - Default capability surface via Dockerfile: `curl`, `jq`, `gh`, `aws-cli`, `kubectl`, `git`, `grep`, `sed`, `gawk`, `ripgrep`.
 
+[1.1.0-rc.1]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.1
 [1.0.0-rc.3]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.3
 [1.0.0-rc.2]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.1

@@ -8,6 +8,7 @@ import type { ResolvedPolicy } from "../capabilities/policy.js";
 import type { Binding } from "../exec/interpolate.js";
 import type { Redactor } from "../credentials/redactor.js";
 import type { CatalogInfo, CatalogSpec, ExecResponse } from "../io/protocol.js";
+import type { McpClient } from "../mcp/client.js";
 import { A2EError } from "../errors.js";
 import { isReservedEnvKey } from "./validation.js";
 import { logger } from "../logging/logger.js";
@@ -24,6 +25,8 @@ export interface SessionInit {
   readonly expires_at: Date;
   readonly transcript_path: string;
   readonly catalog: CatalogInfo | null;
+  /** MCP clients connected at session-create time. Empty map when none configured. */
+  readonly mcpClients?: ReadonlyMap<string, McpClient>;
   /** Original catalog spec, stored so `POST /sessions/:id/resume` can verify
    *  disk state still matches. Null when the session was created without a catalog. */
   readonly catalog_spec?: CatalogSpec | null;
@@ -59,6 +62,8 @@ export interface Session {
    */
   readonly transcript: Transcript;
   readonly catalog: CatalogInfo | null;
+  /** RFC 001 v1.1 — connected MCP servers keyed by server id. */
+  readonly mcpClients: ReadonlyMap<string, McpClient>;
 
   getCwd(): string;
   setCwd(abs: string): void;
@@ -226,6 +231,7 @@ export function createSession(init: SessionInit): Session {
     // not the captured-at-create-time reference.
     get transcript() { return transcript; },
     catalog: init.catalog,
+    mcpClients: init.mcpClients ?? new Map<string, McpClient>(),
 
     getCwd: () => cwd,
     setCwd(abs: string) {

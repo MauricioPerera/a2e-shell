@@ -15,9 +15,11 @@ import { readState } from "./persistence.js";
 import { A2EError } from "../errors.js";
 import { bootstrapCatalog } from "../catalog/bootstrap.js";
 import type { CatalogCache } from "../catalog/cache.js";
-import type { CatalogInfo, CreateSessionRequest } from "../io/protocol.js";
+import type { CatalogInfo, CreateSessionRequest, McpServerInfo } from "../io/protocol.js";
 import { logger } from "../logging/logger.js";
 import { sessionsActive, sessionLifecycle } from "../metrics/metrics.js";
+import { connectMcpServer, type McpClient } from "../mcp/client.js";
+import { buildMcpReachability } from "../mcp/reachability.js";
 
 export interface ManagerConfig {
   readonly sessionsDir: string;
@@ -77,6 +79,11 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       if (req.catalog?.auth?.type === "token") {
         redactKeys.push(req.catalog.auth.env_var);
       }
+      // Same discipline for MCP auth: the token lives in an env var and we
+      // never want its value echoed into any stream surfacing to the agent.
+      for (const server of req.mcp_servers ?? []) {
+        if (server.auth?.type === "token") redactKeys.push(server.auth.env_var);
+      }
       const redactor = buildRedactor(redactKeys, process.env);
       validateEnvMap(req.initial_env);
       const defaultCwd = path.join(cfg.sessionsDir, id);
@@ -124,6 +131,53 @@ export function createManager(cfg: ManagerConfig): SessionManager {
         }
       }
 
+      // RFC 001 v1.1 — connect MCP servers (if any) and cache tool lists.
+      // If any server fails to connect, wipe the session dir and reject the
+      // entire create — same defense-in-depth as catalog bootstrap failures.
+      const mcpClients = new Map<string, McpClient>();
+      if (req.mcp_servers && req.mcp_servers.length > 0) {
+        try {
+          for (const spec of req.mcp_servers) {
+            const client = await connectMcpServer({
+              spec,
+              processEnv: process.env,
+              redactor,
+            });
+            mcpClients.set(spec.id, client);
+          }
+        } catch (e) {
+          for (const c of mcpClients.values()) c.close();
+          await fsp.rm(path.join(cfg.sessionsDir, id), { recursive: true, force: true }).catch(() => {});
+          sessionLifecycle.inc({ event: "mcp_connect_failed" });
+          logger.warn({
+            event: "mcp.server.connect_failed",
+            session_id: id,
+            code: e instanceof A2EError ? e.code : "INTERNAL",
+          });
+          throw e;
+        }
+      }
+
+      // If we have a catalog AND MCP clients, write an mcp-tools.json file
+      // into the catalog's index dir so reachability queries see MCP tools.
+      if (catalog && mcpClients.size > 0) {
+        const mcpReport = buildMcpReachability(mcpClients);
+        if (mcpReport) {
+          try {
+            await fsp.writeFile(
+              path.join(catalog.index_dir, "mcp-tools.json"),
+              JSON.stringify(mcpReport, null, 2),
+            );
+          } catch (e) {
+            logger.warn({
+              event: "mcp.reachability.write_failed",
+              session_id: id,
+              err: String(e),
+            });
+          }
+        }
+      }
+
       const session = createSession({
         session_id: id,
         policy,
@@ -135,6 +189,7 @@ export function createManager(cfg: ManagerConfig): SessionManager {
         catalog,
         catalog_spec: req.catalog ?? null,
         persistenceEnabled: cfg.persistenceEnabled,
+        mcpClients,
       });
       sessions.set(id, session);
       sessionsActive.set(sessions.size);
@@ -261,6 +316,8 @@ export function createManager(cfg: ManagerConfig): SessionManager {
         sessionsActive.set(sessions.size);
         sessionLifecycle.inc({ event: "deleted" });
         logger.info({ event: "session.deleted", session_id: id });
+        // Close MCP clients (no-op in HTTP transport; placeholder for SSE/stdio).
+        for (const c of s.mcpClients.values()) c.close();
         // Synchronous disk cleanup so 204 is an honest "all gone". The git
         // worktree prune is still fire-and-forget since it only touches metadata.
         await removeSessionDir(cfg.sessionsDir, id);

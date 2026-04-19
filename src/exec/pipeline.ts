@@ -16,6 +16,7 @@ import { logger } from "../logging/logger.js";
 import { execDurationMs, execTotal, errorsTotal } from "../metrics/metrics.js";
 import * as path from "node:path";
 import * as fsp from "node:fs/promises";
+import { handleMcpInvoke, isMcpInvoke } from "../mcp/invoke.js";
 
 type TurnOutcome = "ok" | "error" | "intercept";
 interface TurnResult {
@@ -91,6 +92,32 @@ async function runTurn(
     interpolated = interpolate(req.command, session.getBindings());
   } catch (e) {
     return { response: errorResponse(e), outcome: "error" };
+  }
+
+  // RFC 001 v1.1 — MCP gateway intercept. Runs BEFORE state-intercept and
+  // BEFORE binary allowlist enforcement because /bin/mcp-invoke is a reserved
+  // virtual path, not a real binary. If the command matches, this branch
+  // handles it end-to-end and returns a canonical response.
+  if (isMcpInvoke(interpolated)) {
+    const result = await handleMcpInvoke({
+      mcpClients: session.mcpClients,
+      policy: session.policy,
+      redactor: session.redactor,
+      req: { ...req, command: interpolated },
+    });
+    if (result.kind === "handled") {
+      // Capture binding if provided and the call succeeded.
+      if (result.binding && req.bind_as && !result.response.error) {
+        try {
+          session.bind(req.bind_as, result.binding);
+        } catch (e) {
+          return { response: errorResponse(e), outcome: "error" };
+        }
+      }
+      const outcome: TurnOutcome = result.response.error ? "error" : "ok";
+      return { response: result.response, outcome };
+    }
+    // Fall through on "pass" (defensive — shouldn't happen since isMcpInvoke was true).
   }
 
   // Intercept branch (cd/export/unset) — no spawn.

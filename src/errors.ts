@@ -14,6 +14,12 @@ export const ERROR_CODES = [
   "RATE_LIMITED",
   "SERVICE_UNAVAILABLE",
   "NOT_IMPLEMENTED_V1",
+  // v1.1 — MCP gateway (RFC 001)
+  "MCP_SERVER_UNREACHABLE",
+  "MCP_AUTH_FAILED",
+  "MCP_TOOL_NOT_FOUND",
+  "MCP_PROTOCOL_ERROR",
+  "MCP_TIMEOUT",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -45,4 +51,12 @@ export const httpStatusForCode: Record<ErrorCode, number> = {
   RATE_LIMITED: 429,
   SERVICE_UNAVAILABLE: 503,
   NOT_IMPLEMENTED_V1: 400,
+  // MCP gateway. Server-level errors (unreachable, auth) surface as HTTP.
+  // Tool-level errors (NOT_FOUND, TIMEOUT, PROTOCOL_ERROR) surface inside
+  // exec canonical response at HTTP 200.
+  MCP_SERVER_UNREACHABLE: 503,
+  MCP_AUTH_FAILED: 401,
+  MCP_TOOL_NOT_FOUND: 200,
+  MCP_PROTOCOL_ERROR: 200,
+  MCP_TIMEOUT: 200,
 };
