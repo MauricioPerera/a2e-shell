@@ -12,6 +12,7 @@ export const ERROR_CODES = [
   "CONFLICT",
   "PAYLOAD_TOO_LARGE",
   "RATE_LIMITED",
+  "SERVICE_UNAVAILABLE",
   "NOT_IMPLEMENTED_V1",
 ] as const;
 
@@ -42,5 +43,6 @@ export const httpStatusForCode: Record<ErrorCode, number> = {
   CONFLICT: 409,
   PAYLOAD_TOO_LARGE: 413,
   RATE_LIMITED: 429,
+  SERVICE_UNAVAILABLE: 503,
   NOT_IMPLEMENTED_V1: 400,
 };

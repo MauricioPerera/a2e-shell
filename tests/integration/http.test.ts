@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildApp } from "../../src/http/server.js";
+import { createLifecycle } from "../../src/http/lifecycle.js";
 import { createManager } from "../../src/session/manager.js";
 import { createCatalogCache } from "../../src/catalog/cache.js";
 
@@ -22,8 +23,10 @@ function makeApp(opts?: {
     catalogCache,
     allowedCwdPrefixes: [],
   });
+  const lifecycle = createLifecycle();
   const app = buildApp({
     manager,
+    lifecycle,
     config: {
       port: 0,
       authTokens: opts?.authTokens ?? [],
@@ -31,9 +34,10 @@ function makeApp(opts?: {
       redactEnvKeys: [],
       rateLimitPerMinute: opts?.rateLimitPerMinute ?? 0,
       rateLimitCreatePerMinute: opts?.rateLimitCreatePerMinute ?? 0,
+      workerId: "test-worker",
     },
   });
-  return { app, sessionsDir };
+  return { app, sessionsDir, lifecycle };
 }
 
 async function postJson(app: ReturnType<typeof makeApp>["app"], url: string, body: unknown, headers?: Record<string, string>) {
@@ -248,5 +252,54 @@ describe("HTTP server", () => {
     const ss = (await state.json()) as { cwd: string };
     // cd resolved to HOME → cwd is the tmpdir path.
     expect(ss.cwd).toBe(path.resolve(home));
+  });
+
+  it("every response carries X-Worker-Id", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const r = await app.request("/healthz");
+    expect(r.headers.get("X-Worker-Id")).toBe("test-worker");
+    const create = await postJson(app, "/sessions", {});
+    expect(create.headers.get("X-Worker-Id")).toBe("test-worker");
+  });
+
+  it("drain rejects mutating ops with 503 but allows reads", async () => {
+    const { app, sessionsDir, lifecycle } = makeApp();
+    cleanup = sessionsDir;
+    const create = await postJson(app, "/sessions", {});
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    lifecycle.beginDrain();
+
+    // POST /sessions → 503
+    const post = await postJson(app, "/sessions", {});
+    expect(post.status).toBe(503);
+    const postBody = (await post.json()) as { error: string };
+    expect(postBody.error).toBe("SERVICE_UNAVAILABLE");
+
+    // POST /exec → 503
+    const exec = await postJson(app, `/sessions/${sid}/exec`, { command: "printf x" });
+    expect(exec.status).toBe(503);
+
+    // GET /state → still works (read-only, idempotent)
+    const state = await app.request(`/sessions/${sid}/state`);
+    expect(state.status).toBe(200);
+
+    // GET /healthz → always works
+    const health = await app.request("/healthz");
+    expect(health.status).toBe(200);
+  });
+
+  it("waitForDrain resolves once in-flight reaches 0", async () => {
+    const { app, sessionsDir, lifecycle } = makeApp();
+    cleanup = sessionsDir;
+    // No requests in flight yet — drain should resolve immediately.
+    lifecycle.beginDrain();
+    const drained = await lifecycle.waitForDrain(1000);
+    expect(drained).toBe(true);
+    expect(lifecycle.state()).toBe("stopped");
+    // Simulate a post-drain read → still 200 (GET is non-mutating).
+    const r = await app.request("/healthz");
+    expect(r.status).toBe(200);
   });
 });

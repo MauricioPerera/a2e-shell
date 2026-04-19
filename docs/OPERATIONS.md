@@ -16,6 +16,9 @@ Environment variables, deployment modes, Dockerfile, and capability configuratio
 | `A2E_RATE_LIMIT_CREATE_PER_MINUTE` | `20` | Cap on `POST /sessions` (keyed by bearer token, else `anon`); `0` = disabled |
 | `A2E_ALLOWED_CWD_PREFIXES` | `<sessionsDir>` | Comma-separated absolute prefixes allowed for `initial_cwd` / PATCH cwd. Empty env = default (sessionsDir only) |
 | `A2E_LOG_LEVEL` | `info` | Pino log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
+| `A2E_WORKER_ID` | random uuid | Stable id for this process. Emitted as `X-Worker-Id` on every response; load balancers MUST honor it for session affinity in multi-worker deployments |
+| `A2E_GRACE_PERIOD_MS` | `30000` | Max time to wait for in-flight requests before forcing exit on SIGTERM/SIGINT. Keep strictly below your orchestrator's kill timeout (e.g. Kubernetes `terminationGracePeriodSeconds`) |
+| `A2E_PID_FILE` | (unset) | If set, the node process writes its real PID here at startup. Use this (not shell `$!`) when the launch command includes env-var prefixes, which can fork an intermediate subshell |
 
 ### Credential redaction
 
@@ -211,6 +214,40 @@ Plus default Node process metrics (heap, event-loop lag, file descriptors) from 
 ### Correlation
 
 `request_id` (uuid) is in every log line, in every HTTP error response body, and in the response header `X-Request-Id`. Per-session audit is `GET /sessions/:id/transcript` (JSONL); per-session snapshot is `GET /sessions/:id/state`.
+
+## Graceful shutdown
+
+On `SIGTERM` or `SIGINT` the process transitions through three lifecycle states:
+
+1. **`accepting`** → default. All requests pass through.
+2. **`draining`** → `POST /sessions`, `POST /sessions/:id/exec`, PATCH routes, and DELETE return `503 SERVICE_UNAVAILABLE`. `GET /state`, `GET /transcript`, `GET /healthz`, `GET /metrics` still serve (read-only and idempotent ops stay available so orchestrators can observe the shutdown). In-flight mutating ops continue until they finish.
+3. **`stopped`** → the HTTP server has been closed; the process exits with code 0 (clean drain) or 1 (grace timeout).
+
+The handler emits one structured log per transition: `server.signal.received`, `server.shutdown.begin` (with `in_flight` count), `server.draining`, `server.shutdown.done` (with `drained_cleanly: boolean`), `server.shutdown.http_closed`.
+
+If `A2E_GRACE_PERIOD_MS` elapses before in-flight reaches 0, the server force-closes HTTP and exits 1. The event log shows `drained_cleanly: false`. Tune this to your longest exec + small slack; set your container orchestrator's kill timeout (e.g. Kubernetes `terminationGracePeriodSeconds`) to at least `A2E_GRACE_PERIOD_MS / 1000 + 5`.
+
+### PID file
+
+Kubernetes and systemd handle signals on their own. For shell-based deployments, use `A2E_PID_FILE`: the node process writes its real PID there at startup, surviving env-var prefix subshell forking that makes `$!` unreliable. Example:
+
+```bash
+A2E_PID_FILE=/run/a2e.pid A2E_PORT=8080 node dist/index.js &
+# later...
+kill -TERM "$(cat /run/a2e.pid)"
+```
+
+## Multi-worker deployments
+
+Every session's transcript and catalog worktrees live on one specific worker's disk. Load balancers MUST route a session's subsequent requests to the same worker. The header `X-Worker-Id` on every response is the anchor for sticky routing.
+
+Typical reverse-proxy setup:
+
+- Extract `X-Worker-Id` from the session's create response on the client side.
+- Send every follow-up request with `X-Worker-Id: <id>` to the upstream, letting the load balancer pin to that backend.
+- Alternative: cookie-based affinity where the cookie value is the session_id; hash consistently to the backend that created the session.
+
+**Shared catalog cache across workers**: the cache dir can safely be on a shared volume (network filesystem). Mirror creation is guarded by an advisory file lock at `<cache_dir>/<repo_hash>/.lock` (exclusive-create, stolen after 10 min idle). Concurrent workers either share an existing mirror read-only or wait for the lock holder to finish cloning — no duplicate clones, no partial-directory corruption.
 
 ## Cleanup and lifecycle
 

@@ -51,6 +51,9 @@ export interface CatalogCacheConfig {
 
 /** Upper-bound on git subprocess calls run from sweep tasks. */
 const SWEEP_GIT_TIMEOUT_MS = 10_000;
+/** Cross-process lock settings for mirror creation. */
+const MIRROR_LOCK_STALE_MS = 10 * 60_000; // 10 min — considered dead
+const MIRROR_LOCK_POLL_MS = 100;
 /** Transient git error strings that warrant a retry in resolveSha. */
 const TRANSIENT_ERROR_PATTERNS = [
   /ECONNRESET/i,
@@ -108,25 +111,42 @@ export function createCatalogCache(cfg: CatalogCacheConfig): CatalogCache {
     // Returns true if the mirror existed before this call (cache hit).
     const existed = fs.existsSync(mirrorPath);
     if (!existed) {
-      const cloneStart = Date.now();
+      // Cross-process lock: prevent two workers clone-racing the same repo.
+      // The in-process inFlight map above only coalesces within this process.
       fs.mkdirSync(path.dirname(mirrorPath), { recursive: true });
-      const cloneArgs = [...authArgs, "clone", "--bare"];
-      if (cfg.filterBlobs) cloneArgs.push("--filter=blob:none");
-      cloneArgs.push(repoUrl, mirrorPath);
-      await runGit(cloneArgs, timeoutMs, undefined, redactor, authEnv);
-      await markRefreshed(mirrorPath);
-      // Seed the access marker now so LRU doesn't see stat() fallback on a
-      // newly-cloned mirror before any materialize finishes.
-      await touchAccess(mirrorPath);
-      catalogMirrorEvents.inc({ event: "created" });
-      catalogMirrorsActive.inc();
-      logger.info({
-        event: "catalog.mirror.created",
-        mirror_path: mirrorPath,
-        duration_ms: Date.now() - cloneStart,
-        filter_blobs: cfg.filterBlobs,
-      });
-      return false;
+      const lockPath = path.join(path.dirname(mirrorPath), ".lock");
+      const releaseLock = await acquireLock(lockPath, timeoutMs);
+      try {
+        // Another worker may have finished cloning while we waited for the lock.
+        if (fs.existsSync(mirrorPath)) {
+          logger.info({
+            event: "catalog.mirror.claimed",
+            mirror_path: mirrorPath,
+            note: "another worker created the mirror while we waited",
+          });
+          return true;
+        }
+        const cloneStart = Date.now();
+        const cloneArgs = [...authArgs, "clone", "--bare"];
+        if (cfg.filterBlobs) cloneArgs.push("--filter=blob:none");
+        cloneArgs.push(repoUrl, mirrorPath);
+        await runGit(cloneArgs, timeoutMs, undefined, redactor, authEnv);
+        await markRefreshed(mirrorPath);
+        // Seed the access marker now so LRU doesn't see stat() fallback on a
+        // newly-cloned mirror before any materialize finishes.
+        await touchAccess(mirrorPath);
+        catalogMirrorEvents.inc({ event: "created" });
+        catalogMirrorsActive.inc();
+        logger.info({
+          event: "catalog.mirror.created",
+          mirror_path: mirrorPath,
+          duration_ms: Date.now() - cloneStart,
+          filter_blobs: cfg.filterBlobs,
+        });
+        return false;
+      } finally {
+        await releaseLock();
+      }
     }
     if (await needsRefresh(mirrorPath, cfg.refreshSeconds)) {
       const refreshStart = Date.now();
@@ -443,6 +463,57 @@ async function dirSizeBytes(p: string): Promise<number> {
     }
   }
   return total;
+}
+
+/**
+ * Cross-process advisory lock via exclusive file creation.
+ *
+ * Creates `<lockPath>` with O_CREAT|O_EXCL. On EEXIST, polls every 100ms until
+ * either the lock file disappears or its mtime exceeds MIRROR_LOCK_STALE_MS
+ * (holder crashed). Stale locks are stolen with a warning.
+ *
+ * Multi-process safe because `open(path, 'wx')` is atomic at the OS layer.
+ */
+async function acquireLock(lockPath: string, timeoutMs: number): Promise<() => Promise<void>> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      const fh = await fsp.open(lockPath, "wx");
+      await fh.writeFile(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+      await fh.close();
+      return async () => {
+        try { await fsp.unlink(lockPath); } catch { /* already gone */ }
+      };
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code !== "EEXIST") throw e;
+      // Check for stale holder.
+      try {
+        const st = await fsp.stat(lockPath);
+        const ageMs = Date.now() - st.mtimeMs;
+        if (ageMs > MIRROR_LOCK_STALE_MS) {
+          logger.warn({
+            event: "catalog.lock.stale_steal",
+            lock_path: lockPath,
+            age_ms: ageMs,
+          });
+          await fsp.unlink(lockPath).catch(() => { /* raced */ });
+          continue;
+        }
+      } catch {
+        // Lock vanished between EEXIST and stat; retry immediately.
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new A2EError(
+          "TIMEOUT",
+          `could not acquire mirror lock within ${timeoutMs}ms: ${lockPath}`,
+          500,
+        );
+      }
+      await new Promise((r) => setTimeout(r, MIRROR_LOCK_POLL_MS));
+    }
+  }
 }
 
 async function touchAccess(mirrorPath: string): Promise<void> {

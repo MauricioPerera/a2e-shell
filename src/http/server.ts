@@ -13,6 +13,7 @@ import {
   rateLimitHits,
   redactorSecrets,
 } from "../metrics/metrics.js";
+import type { Lifecycle } from "./lifecycle.js";
 import type { SessionManager } from "../session/manager.js";
 import { mountSessions } from "./routes/sessions.js";
 import { mountExec } from "./routes/exec.js";
@@ -28,11 +29,19 @@ export interface ServerConfig {
   readonly rateLimitPerMinute: number;
   /** Rate limit for POST /sessions (keyed by bearer token, else 'anon'). 0 = disabled. */
   readonly rateLimitCreatePerMinute: number;
+  /**
+   * Stable id emitted as `X-Worker-Id` on every response and in session-create
+   * bodies. Load balancers MUST honor this header for session affinity in
+   * multi-worker deployments — a session's transcript and catalog live on a
+   * specific worker's disk.
+   */
+  readonly workerId: string;
 }
 
 export interface ServerDeps {
   readonly manager: SessionManager;
   readonly config: ServerConfig;
+  readonly lifecycle: Lifecycle;
 }
 
 export type AppVariables = { request_id: string };
@@ -49,7 +58,9 @@ export function buildApp(deps: ServerDeps): Hono<AppEnv> {
   redactorSecrets.set(serverRedactor.secrets.length);
 
   app.use("*", requestId());
+  app.use("*", workerIdHeader(deps.config.workerId));
   app.use("*", observability());
+  app.use("*", drainGate(deps.lifecycle));
   app.use("*", bodyLimit(deps.config.maxRequestBytes));
   app.use("/sessions/*", auth(deps.config.authTokens));
   app.use("/sessions", auth(deps.config.authTokens));
@@ -131,6 +142,29 @@ function requestId(): MiddlewareHandler<AppEnv> {
     c.set("request_id", rid);
     c.header("X-Request-Id", rid);
     await next();
+  };
+}
+
+function workerIdHeader(workerId: string): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    c.header("X-Worker-Id", workerId);
+    await next();
+  };
+}
+
+/**
+ * Gate requests through the lifecycle tracker: rejects mutating ops with 503
+ * during drain, increments/decrements the in-flight counter so `waitForDrain`
+ * can resolve when the last request finishes.
+ */
+function drainGate(lifecycle: Lifecycle): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    lifecycle.checkAndIncrement(c.req.method, c.req.path);
+    try {
+      await next();
+    } finally {
+      lifecycle.decrement();
+    }
   };
 }
 
