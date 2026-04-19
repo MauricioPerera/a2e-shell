@@ -15,20 +15,11 @@ Items below are grouped by release, not by calendar. Ordering within a release i
 
 ## v0.1 — shipped
 
-What exists today:
-
-- HTTP API (`POST /sessions`, `POST /sessions/:id/exec`, state + transcript + replay + cwd + env PATCH, DELETE).
-- Exec pipeline: interpolate → intercept → policy → spawn → redact → format.
-- Canonical response with `stderr`, `truncated`, `idempotent_hit`.
-- Catalog layer: git-backed, pinnable by branch/tag/SHA, shared bare mirror, partial clone, reachability analysis, auth via HTTPS token and SSH key (env-var-named).
-- Caps: bindings (count + per-size + aggregate), transcript size, rate limit per session, rate limit per caller on create, body size.
-- Reserved env keys enforced at the single-source `session.setEnv` gate.
-- Redactor over stdout, stderr, transcript, HTTP error messages.
-- 108 tests (unit + integration), strict TypeScript, documented.
+Initial HTTP API (`POST /sessions`, `POST /sessions/:id/exec`, state + transcript + replay + cwd + env PATCH, DELETE), exec pipeline, canonical response, catalog layer (git-backed, pinnable, shared bare mirror, partial clone, reachability, token + ssh_key auth), caps (bindings, transcript, rate limits, body size), reserved env keys single-source, redactor over all egress channels.
 
 ---
 
-## v0.2 — Operability
+## v0.2 — Operability — **shipped**
 
 **Theme**: deploy, watch, recover.
 
@@ -65,7 +56,7 @@ What exists today:
 
 ---
 
-## v0.3 — Resilience
+## v0.3 — Resilience — **shipped**
 
 **Theme**: survive partial failures, handle long-running work.
 
@@ -105,7 +96,9 @@ What exists today:
 
 ---
 
-## v1.0 — Stability
+## v1.0 — Stability — **in rc**
+
+**Current tag: [v1.0.0-rc.3](https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.3)**. Every in-tree item shipped; the only remaining blocker for `v1.0.0` final is the external security audit.
 
 **Theme**: freeze the promise; run it in real production.
 

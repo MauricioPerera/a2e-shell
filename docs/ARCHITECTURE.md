@@ -6,33 +6,39 @@ Internal module layout, request lifecycle, security model, and failure modes.
 
 ```
 src/
-├── index.ts                     entry: env parse, cache init, manager init, app build, listen
-├── errors.ts                    ErrorCode enum, A2EError class, httpStatusForCode table
+├── index.ts                     entry: env parse, TLS opt-in, cache init, manager init, app build, listen, SIGTERM/SIGINT shutdown
+├── errors.ts                    ErrorCode enum (incl. SERVICE_UNAVAILABLE), A2EError class, httpStatusForCode table
 ├── http/
-│   ├── server.ts                Hono app build, middleware stack, onError serializer
+│   ├── server.ts                Hono app build, middleware stack, onError serializer, API_VERSION constant
+│   ├── lifecycle.ts             accepting → draining → stopped state machine, in-flight counter, waitForDrain
 │   └── routes/
-│       ├── sessions.ts          POST /sessions, DELETE /sessions/:id
-│       ├── exec.ts              POST /sessions/:id/exec (+ idempotency handling)
+│       ├── sessions.ts          POST /sessions, DELETE /sessions/:id, POST /sessions/:id/resume (experimental)
+│       ├── exec.ts              POST /sessions/:id/exec + SSE streaming variant + idempotency + post-response flush
 │       ├── state.ts             GET /state, PATCH /cwd, PATCH /env, GET /transcript
 │       └── replay.ts            POST /sessions/:id/replay
 ├── session/
-│   ├── manager.ts               registry of live sessions, create+get+delete+sweep
-│   ├── state.ts                 Session factory: cwd, env overlay, bindings, idempotency cache
+│   ├── manager.ts               registry of live sessions, create+resume+get+delete+sweep
+│   ├── state.ts                 Session factory: cwd, env overlay, bindings, idempotency cache, transcript rotation, persistence orchestration
+│   ├── persistence.ts           atomic state.json writes (tmp + fsync + rename), schema-versioned read path
 │   ├── transcript.ts            JSONL append-only, read iterator, hashFinal
-│   └── validation.ts            shared validators for cwd, env, reserved keys (create + PATCH)
+│   └── validation.ts            shared validators for cwd (realpath symlink check), env, reserved keys (create + PATCH)
 ├── exec/
-│   ├── pipeline.ts              orchestrator for a single turn
-│   ├── interpolate.ts           ${$var} resolver with strict regex
+│   ├── pipeline.ts              orchestrator for a single turn; returns TurnResult {response, outcome}
+│   ├── interpolate.ts           ${$var} resolver with strict regex (single pass, no recursion)
 │   ├── state-intercept.ts       cd/export/unset classifier (pure)
-│   └── run.ts                   spawn bash -c with argv-array, streaming truncation
+│   └── run.ts                   spawn BASH_PATH -c with argv-array, streaming truncation, stream-mode TextDecoder
 ├── capabilities/
 │   └── policy.ts                policy resolver + enforceBinaryAllowlist + isBinaryReachable
 ├── credentials/
-│   └── redactor.ts              byte-level scrubber, longest-match replacement
+│   └── redactor.ts              byte-level scrubber, longest-match replacement, MIN_SECRET_LEN=8
 ├── catalog/
 │   ├── bootstrap.ts             orchestrates index+content materialization, builds auth args+env
-│   ├── cache.ts                 bare mirror + worktree + concurrency coalescing
+│   ├── cache.ts                 shared bare mirror + worktree + cross-process flock + LRU sweep + in-flight coalescing
 │   └── reachability.ts          static analysis skills.requires ↔ policy.binaries_allowlist
+├── logging/
+│   └── logger.ts                pino with A2E_LOG_LEVEL + defensive internal redact list
+├── metrics/
+│   └── metrics.ts               prom-client registry: http, exec, sessions, catalog, rate limits, redactor, transcript
 └── io/
     ├── protocol.ts              ALL Zod schemas (requests, responses, catalog, auth)
     └── format.ts                canonical ExecResponse builder, shape detector
@@ -40,13 +46,26 @@ src/
 
 ## Request lifecycle
 
+### Middleware stack (every request)
+
+```
+requestId           → X-Request-Id (UUID)
+workerIdHeader      → X-Worker-Id (stable per-process id for LB affinity)
+apiVersionHeader    → X-API-Version: 1 (v1.0 schema lock)
+observability       → structured log + Prometheus metrics (route label bounded)
+drainGate           → 503 SERVICE_UNAVAILABLE on mutating ops during shutdown
+bodyLimit           → 413 PAYLOAD_TOO_LARGE if over A2E_MAX_REQUEST_BYTES
+auth                → 401 UNAUTHORIZED if bearer missing/invalid (disabled when tokens list empty)
+rateLimit           → 429 RATE_LIMITED per-session; separate bucket on POST /sessions
+```
+
+Unauthenticated routes: `GET /healthz`, `GET /metrics`. Both always return; neither gated by drainGate so k8s probes and scrapers keep working through shutdown.
+
 ### `POST /sessions`
 
 ```
 request
-  ├── requestId middleware           → set X-Request-Id
-  ├── bodyLimit middleware            → 413 if > A2E_MAX_REQUEST_BYTES
-  ├── auth middleware                 → 401 if bearer missing/invalid
+  ├── middleware stack (above)
   └── route handler
       ├── JSON parse                  → 400 PARSE_ERROR on malformed
       ├── Zod schema validation       → 400 PARSE_ERROR on unknown fields, etc.
@@ -60,7 +79,9 @@ request
           │     bootstrapCatalog()    → {buildGitAuth, cache.materialize ×2, compute reachability}
           │     on failure → rm -rf sessions/<id>, throw
           ├── createSession()         → in-memory Session object
-          └── sessions.set(id, ...)
+          ├── sessions.set(id, ...)
+          └── if persistenceEnabled: session.touchForPersistence() + await flush()
+                                     → state.json on disk before 201 returns
       └── return 201 + CreateSessionResponse
 ```
 
@@ -68,20 +89,26 @@ request
 
 ```
 request
-  ├── requestId
-  ├── bodyLimit
-  ├── auth
-  ├── rateLimit                       → 429 if over A2E_RATE_LIMIT_PER_MINUTE
+  ├── middleware stack (auth + drainGate + rateLimit by session id)
   └── route handler
       ├── JSON parse + schema         → 400 PARSE_ERROR
       ├── manager.get(id)             → 404 NOT_FOUND / 409 CONFLICT (expired)
+      ├── if Accept: text/event-stream → stream path (SSE)
       ├── if idempotency_key:
-      │     session.idempotencyGet()  → on hit, return cached + transcript
+      │     session.idempotencyInflight() → await live promise if racing
+      │     session.idempotencyGet()  → on hit, replay + transcript + 200
       ├── executeTurn(session, req)   → see below
       ├── session.idempotencyPut()
-      ├── session.appendTranscript()  → redactor + JSONL append + byte cap
+      ├── session.appendTranscript()  → redactor + JSONL append + byte cap (rotates on threshold)
+      ├── await session.flush()       → persistence write durable before 200 (noop if off)
       └── return 200 + ExecResponse
+
+SSE variant emits: start → {stdout,stderr}* → done (canonical ExecResponse) → flush
 ```
+
+### `POST /sessions/:id/resume` (experimental)
+
+Requires `A2E_SESSION_PERSISTENCE=true`. Reads `sessions/<id>/state.json`, validates `schema_version`, reconstructs the in-memory `Session` (cwd, env overlay, bindings, turn counter, transcript metadata). Returns the same shape as `POST /sessions`. Best-effort: cross-worker coordination is out of scope — pin the `X-Worker-Id` you got on create.
 
 ### `executeTurn` pipeline
 
@@ -184,8 +211,11 @@ TERMINATED               via DELETE OR TTL expiry OR sweepExpired
 | Failure | Where caught | Response |
 |---|---|---|
 | Malformed request body | route + Zod | 400 `PARSE_ERROR` |
+| Missing / invalid bearer | `auth` middleware | 401 `UNAUTHORIZED` |
 | Unknown session | `manager.get` | 404 `NOT_FOUND` |
 | Expired session on get | `manager.get` | 409 `CONFLICT` + cleanup |
+| Mutating op during drain | `drainGate` | 503 `SERVICE_UNAVAILABLE` |
+| Rate limit exceeded | `rateLimit` | 429 `RATE_LIMITED` |
 | Catalog auth env var missing | `buildGitAuth` | 403 `CAPABILITY_DENIED` |
 | Catalog ref not resolvable | `cache.resolveSha` → bubbles | 500 `UPSTREAM_ERROR` + cleanup |
 | Catalog clone times out | `cache.runGit` | 500 `TIMEOUT` or `UPSTREAM_ERROR` + cleanup |
@@ -197,37 +227,47 @@ TERMINATED               via DELETE OR TTL expiry OR sweepExpired
 | Transcript full | `session.appendTranscript` | 200 `ExecResponse` + transcript append fails on NEXT exec |
 | Stdin write EPIPE | `run.ts` stdin.on('error') | Swallowed; exit code tells the story |
 | Subprocess crashes | `run.ts` close event | 200 with actual exit code |
+| Persistence write failure | `runFlush` | logged as `session.persist.failed`; response still sent (state kept in memory) |
 | Hono internal error | `app.onError` | 500 `INTERNAL` |
 
 ## Concurrency
 
 - **Session Map access**: single-threaded (Node event loop), no races within a process.
-- **Catalog cache coalescing**: multiple sessions requesting the same `repo_url` share one in-flight promise for mirror setup.
-- **Rate limit counter**: per-session Map, also single-threaded.
-- **Transcript appends**: each session is a single event-loop consumer — no interleaving.
-- **Multi-process deployments**: each worker has its own Map + cache. Session routing must be sticky (reverse proxy) OR sessions restricted to a single worker. Shared cache across workers requires pointing all workers at the same `A2E_CATALOG_CACHE_DIR` — git operations hold their own locks.
+- **Catalog cache coalescing**: multiple sessions requesting the same `repo_url` share one in-flight promise for mirror setup. Cross-process races resolved via atomic `open(path, 'wx')` flock with stale-stealing.
+- **Idempotency on /exec**: per-session `Map<key, Promise<ExecResponse>>` inflight tracker plus TTL-bounded response cache coalesces concurrent duplicate requests to a single execution.
+- **Rate limit counter**: per-session Map, single-threaded. Timer-based GC (`setInterval.unref()`).
+- **Transcript appends**: each session is a single event-loop consumer — no interleaving. Rotates at 80% of the size cap.
+- **Persistence flush**: `markDirty()` sets a flag and kicks off an async writer; mutation routes `await session.flush()` before 200 so a crash doesn't silently drop the turn. Coalescing: multiple markDirty() calls during one write collapse to a single follow-up write.
+- **Multi-process deployments**: each worker has its own Map + cache. Session routing must be sticky via `X-Worker-Id` (every response carries it). Shared cache across workers requires pointing all workers at the same `A2E_CATALOG_CACHE_DIR`.
+
+## Graceful shutdown
+
+```
+SIGTERM / SIGINT
+  └── lifecycle.beginDrain()            state: accepting → draining
+      ├── drainGate now rejects mutating ops with 503 SERVICE_UNAVAILABLE
+      ├── GET /healthz, GET /metrics still serve (probes/scrapers)
+      └── GET reads on existing sessions still serve
+  └── lifecycle.waitForDrain(timeoutMs)
+      ├── resolves when in-flight counter hits 0, OR
+      └── rejects after A2E_GRACE_PERIOD_MS
+  └── server.close()                    stop accepting connections
+  └── catalogCache.shutdown()           clear sweep interval
+  └── logger.flush()
+  └── setTimeout(200ms) → process.exit(cleanDrain ? 0 : 1)
+```
+
+`A2E_GRACE_PERIOD_MS` must be strictly below the orchestrator's kill timeout (`terminationGracePeriodSeconds` in k8s, `stop_grace_period` in Compose). All three `deploy/` templates enforce that ratio.
 
 ## Testing
 
-- **Unit tests** (`tests/unit/`): pure functions with no subprocess. Run on any platform with Node 22. 95 tests, <1s.
-- **Integration tests** (`tests/integration/`): Hono `app.request` against the full middleware stack with in-memory manager. 12 tests, <100ms total.
-- **Cache tests** invoke real `git` via `sh` — Linux only. Skipped on Windows by default.
+- **Unit tests** (`tests/unit/`): pure functions with no subprocess. Run on any platform with Node 22.
+- **Integration tests** (`tests/integration/`): Hono `app.request` against the full middleware stack with in-memory manager.
+- **Cache tests** invoke real `git` via `sh`. On Windows, `tests/setup.ts` resolves Git-for-Windows bash.
+- **Benchmarks** (`tests/benchmarks/`): `http.bench.ts` (p95 SLO gate, runs in CI) and `tokens.ts` (prompt-token savings vs raw dump).
 
-Coverage by concern:
-
-| Concern | Tests |
-|---|---|
-| interpolation grammar | 10 |
-| state intercept classifier | 10 |
-| binary allowlist + substitution rejection | 12 |
-| credential redactor | 7 |
-| canonical formatter (incl. stderr + truncated) | 18 |
-| catalog auth spec schema | 13 |
-| git auth builder (token + ssh_key) | 9 |
-| catalog cache + concurrency + filter | 5 |
-| reachability analysis | 8 |
-| HTTP routes + auth + rate limit | 12 |
+Total: **133 tests**, ~20s. CI runs typecheck + full suite + bench on every PR.
 
 ## Version
 
-v0.1. Breaking changes allowed freely. v1.0 will lock the HTTP schemas and env var names.
+**v1.0.0-rc.3**. Schema lock in effect: HTTP routes, response headers, error codes, and env var names are a stable contract. Additive changes land as minors; breaking changes ship under `/v2/*`. See [CHANGELOG.md](../CHANGELOG.md) for the frozen surface per release.
