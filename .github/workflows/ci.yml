@@ -49,3 +49,21 @@ jobs:
           name: bench-results
           path: bench-results.json
           retention-days: 30
+
+  # Production Docker image smoke — gates the compiled + pruned layout that
+  # vitest can't exercise. Closes the v1.3.0 postmortem followup: two
+  # packaging bugs shipped in rc (peggy as devDep, grammar.pegjs not in dist)
+  # that only surfaced in prod because the test suite runs from src/.
+  #
+  # Runs on every push to main and on any tag, so a bad build never
+  # survives into a release without tripping this gate first.
+  docker-smoke:
+    name: docker smoke (prod image)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + run + smoke (bounded + stdio MCP)
+        run: |
+          chmod +x scripts/smoke-prod-image.sh
+          bash scripts/smoke-prod-image.sh
