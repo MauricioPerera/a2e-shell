@@ -58,15 +58,24 @@ Margins are generous on top of empirical to absorb tokenizer/shape-inference dri
 - `GRAMMAR.ebnf` already existed at the repo root (authored in v1.0-rc.3 as the bounded-mode spec). It is now **executable** — the peggy grammar at `src/parser/grammar.pegjs` derives from it.
 - `docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md` §1 and §6 updated to reflect the per-regime cost claims, replacing the universal "≤20%" with an honest breakdown.
 
+### Persistence
+
+- **Bounded state is persisted** alongside the outer session's `state.json` as a side-file `bounded-state.json`. Zero coupling with the PersistedSession schema (unchanged from v1.1). When `A2E_SESSION_PERSISTENCE=true`, every successful bounded turn triggers a fire-and-forget atomic write (stage-to-tmp + fsync + rename). On `POST /sessions/:id/resume`, the bounded runtime hydrates lazily on first turn.
+- `src/runtime/persist.ts`: serialize/deserialize BoundedSession.
+  - Buffer values encoded as `{ __buffer__: "<base64>" }` sentinel → round-trips back to Buffer on read.
+  - Transcript `stmt` (parsed AST) dropped on serialize; `command` source preserved. `history` meta shows "?" for pre-restore turns, real verb for post-restore.
+  - Schema version pinned at 1; mismatches throw on read.
+- `src/exec/pipeline-bounded.ts`: hydrate-or-fresh on first access (WeakMap coalesces concurrent hydrations), schedule-persist after every turn (WeakMap coalesces concurrent writes).
+- **Corrupt file fallback**: unreadable/invalid `bounded-state.json` logs a warning (`bounded.persist.read_failed`) and starts fresh. The corrupt file is NOT overwritten until the next successful turn — operators can inspect it.
+
 ### Not in this release (deferred)
 
-- **Persistence of bounded session state**: a restored bounded session starts with empty bindings. The outer Session's `state.json` serializes the unrestricted-mode map only.
 - **SSE streaming for bounded**: the JSON path is live; `Accept: text/event-stream` on a bounded session still routes through the unrestricted streaming code and will produce no useful output.
 - **Real `--parallel=N` in `foreach`**: flag is accepted and parsed but iterations run sequentially. Real concurrency needs per-iteration scope stack for the iterVar.
 
 ### Tests
 
-345 passed across 21 files. Typecheck clean.
+357 passed across 22 files. Typecheck clean.
 
 ### Migration
 

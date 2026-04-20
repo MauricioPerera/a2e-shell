@@ -17,8 +17,10 @@
  *   - Bindings live on the BoundedRuntime side, NOT on session.getBindings()
  *     (which is the unrestricted-mode map). They are separate storage by
  *     design — the two modes don't share variable scope.
- *   - Persistence is NOT wired: restoring a bounded session from disk starts
- *     with an empty bindings map. Deferred to v0.2.
+ *   - Persistence (v1.2-rc.1): when session.persistDir is set, the bounded
+ *     runtime reads bounded-state.json on first access (hydrating from disk
+ *     if present) and writes it fire-and-forget after every turn. Failures
+ *     log a warning and do not propagate.
  *   - No idempotency-cache integration is done here; the outer handler in
  *     exec.ts already caches the ExecResponse we return.
  */
@@ -28,6 +30,11 @@ import type { ExecRequest, ExecResponse } from "../io/protocol.js";
 import { describeShape, type CanonicalResponse } from "../runtime/canonical.js";
 import { parseProgram } from "../parser/parse.js";
 import { executeProgram } from "../runtime/execute.js";
+import { logger } from "../logging/logger.js";
+import {
+  readBoundedState,
+  writeBoundedState,
+} from "../runtime/persist.js";
 import {
   createSession as createBoundedSession,
   type CallCapabilities,
@@ -39,11 +46,18 @@ import type { Session } from "../session/state.js";
 // Session, the bounded runtime state becomes unreachable and is GC'd.
 const boundedRuntimes: WeakMap<Session, BoundedSession> = new WeakMap();
 
+/**
+ * Track in-flight hydrations to avoid racing two readBoundedState calls on
+ * the same outer Session (e.g. if two exec requests arrive concurrently
+ * immediately after resume).
+ */
+const hydrations: WeakMap<Session, Promise<BoundedSession>> = new WeakMap();
+
 export async function executeBoundedTurn(
   session: Session,
   req: ExecRequest,
 ): Promise<ExecResponse> {
-  const rt = getOrCreateBoundedRuntime(session);
+  const rt = await getOrCreateBoundedRuntime(session);
 
   try {
     const program = parseProgram(req.command);
@@ -57,7 +71,11 @@ export async function executeBoundedTurn(
       // clients don't get a 200 with no information.
       throw new A2EError("PARSE_ERROR", "empty program");
     }
-    return toExecResponse(last);
+    const resp = toExecResponse(last);
+    // Persist after the turn mutated state. Fire-and-forget — a disk error
+    // must not fail the request (the mutation already succeeded in memory).
+    schedulePersist(session, rt);
+    return resp;
   } catch (e) {
     if (e instanceof A2EError) {
       return errorExecResponse(e.code, e.message);
@@ -66,13 +84,83 @@ export async function executeBoundedTurn(
   }
 }
 
-function getOrCreateBoundedRuntime(session: Session): BoundedSession {
-  let rt = boundedRuntimes.get(session);
-  if (!rt) {
-    rt = createBoundedSession(session.id, capsFromPolicy(session));
-    boundedRuntimes.set(session, rt);
+async function getOrCreateBoundedRuntime(session: Session): Promise<BoundedSession> {
+  const cached = boundedRuntimes.get(session);
+  if (cached) return cached;
+  // Coalesce concurrent hydrations.
+  const inflight = hydrations.get(session);
+  if (inflight) return inflight;
+
+  const promise = hydrate(session).finally(() => hydrations.delete(session));
+  hydrations.set(session, promise);
+  return promise;
+}
+
+async function hydrate(session: Session): Promise<BoundedSession> {
+  const caps = capsFromPolicy(session);
+  let rt: BoundedSession | null = null;
+  if (session.persistDir) {
+    try {
+      rt = await readBoundedState(session.persistDir, caps);
+    } catch (e) {
+      // Corrupt or incompatible file: log and start fresh. Don't wipe the
+      // file — operators may want to inspect it. The next successful turn
+      // will overwrite.
+      logger.warn({
+        event: "bounded.persist.read_failed",
+        session_id: session.id,
+        err: String(e),
+      });
+    }
   }
+  if (!rt) rt = createBoundedSession(session.id, caps);
+  boundedRuntimes.set(session, rt);
   return rt;
+}
+
+/**
+ * Schedule a persistence write without awaiting. Coalesces concurrent writes
+ * per outer Session — if a write is already in flight, a follow-up re-triggers
+ * when it lands so we never lose the latest state.
+ */
+const pendingWrites: WeakMap<Session, { inflight: Promise<void>; pending: boolean }> = new WeakMap();
+
+function schedulePersist(session: Session, rt: BoundedSession): void {
+  if (!session.persistDir) return;
+  const dir = session.persistDir;
+  const state = pendingWrites.get(session);
+  if (state) {
+    state.pending = true;
+    return;
+  }
+  const kick: { inflight: Promise<void>; pending: boolean } = { inflight: Promise.resolve(), pending: false };
+  pendingWrites.set(session, kick);
+  kick.inflight = (async () => {
+    // Loop while new mutations queue up during the write.
+    // Safety: initial write.
+    try {
+      await writeBoundedState(dir, rt);
+    } catch (e) {
+      logger.warn({
+        event: "bounded.persist.write_failed",
+        session_id: session.id,
+        err: String(e),
+      });
+    }
+    while (kick.pending) {
+      kick.pending = false;
+      try {
+        await writeBoundedState(dir, rt);
+      } catch (e) {
+        logger.warn({
+          event: "bounded.persist.write_failed",
+          session_id: session.id,
+          err: String(e),
+        });
+      }
+    }
+    pendingWrites.delete(session);
+  })();
 }
 
 function capsFromPolicy(session: Session): CallCapabilities {

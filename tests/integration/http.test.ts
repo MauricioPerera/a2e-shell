@@ -490,6 +490,119 @@ describe("HTTP server", () => {
     expect(reuseBody.preview).toContain("captured value");
   });
 
+  it("bounded persistence: bindings + transcript survive a manager restart", async () => {
+    // Same pattern as the unrestricted persistence test above, but the
+    // session is created with mode="bounded" and the assertions check the
+    // bounded runtime's own state via the bounded env meta + $var lookup.
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), "http-bounded-persist-"));
+    cleanup = sessionsDir;
+
+    function makeAppOnDir(dir: string) {
+      const catalogCache = createCatalogCache({
+        enabled: false, cacheDir: path.join(dir, ".cache"), refreshSeconds: 3600,
+        filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
+      });
+      const manager = createManager({
+        sessionsDir: dir, redactEnvKeys: [], catalogBootstrapTimeoutMs: 30_000,
+        catalogCache, allowedCwdPrefixes: [], persistenceEnabled: true,
+      });
+      const lifecycle = createLifecycle();
+      const app = buildApp({
+        manager, lifecycle,
+        config: {
+          port: 0, authTokens: [], maxRequestBytes: 1_048_576, redactEnvKeys: [],
+          rateLimitPerMinute: 0, rateLimitCreatePerMinute: 0, workerId: "tw",
+        },
+      });
+      return { app, manager };
+    }
+
+    // --- First manager: bind two variables in a bounded session ---
+    const first = makeAppOnDir(sessionsDir);
+    const create = await postJson(first.app, "/sessions", { mode: "bounded" });
+    expect(create.status).toBe(201);
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+
+    await postJson(first.app, `/sessions/${sid}/exec`, {
+      command: 'save [1,2,3,4,5] as nums',
+    });
+    await postJson(first.app, `/sessions/${sid}/exec`, {
+      command: 'save "survivor" as label',
+    });
+    // Give the fire-and-forget write a chance to land.
+    await new Promise((r) => setTimeout(r, 100));
+
+    // bounded-state.json must exist on disk.
+    const statePath = path.join(sessionsDir, sid, "bounded-state.json");
+    expect(fs.existsSync(statePath), `bounded-state.json missing at ${statePath}`).toBe(true);
+
+    // --- Second manager: resume, verify bindings are back ---
+    const second = makeAppOnDir(sessionsDir);
+    const resumeRes = await postJson(second.app, `/sessions/${sid}/resume`, {});
+    expect(resumeRes.status).toBe(200);
+    expect(((await resumeRes.json()) as { mode: string }).mode).toBe("bounded");
+
+    // env should list both bindings.
+    const envRes = await postJson(second.app, `/sessions/${sid}/exec`, {
+      command: "env",
+    });
+    const envBody = (await envRes.json()) as { preview: { bindings: string[] } };
+    expect(envBody.preview.bindings.sort()).toEqual(["label", "nums"]);
+
+    // $nums resolves to the original list.
+    const showRes = await postJson(second.app, `/sessions/${sid}/exec`, {
+      command: "show $nums",
+    });
+    const showBody = (await showRes.json()) as { preview: number[] };
+    expect(showBody.preview).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("bounded persistence: corrupt state.json falls back to fresh (no crash)", async () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), "http-bounded-corrupt-"));
+    cleanup = sessionsDir;
+
+    function makeAppOnDir(dir: string) {
+      const catalogCache = createCatalogCache({
+        enabled: false, cacheDir: path.join(dir, ".cache"), refreshSeconds: 3600,
+        filterBlobs: false, maxBytes: 0, sweepIntervalSeconds: 0,
+      });
+      const manager = createManager({
+        sessionsDir: dir, redactEnvKeys: [], catalogBootstrapTimeoutMs: 30_000,
+        catalogCache, allowedCwdPrefixes: [], persistenceEnabled: true,
+      });
+      const lifecycle = createLifecycle();
+      const app = buildApp({
+        manager, lifecycle,
+        config: {
+          port: 0, authTokens: [], maxRequestBytes: 1_048_576, redactEnvKeys: [],
+          rateLimitPerMinute: 0, rateLimitCreatePerMinute: 0, workerId: "tw",
+        },
+      });
+      return { app };
+    }
+
+    const first = makeAppOnDir(sessionsDir);
+    const create = await postJson(first.app, "/sessions", { mode: "bounded" });
+    const sid = ((await create.json()) as { session_id: string }).session_id;
+    await postJson(first.app, `/sessions/${sid}/exec`, { command: "save 1 as x" });
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Corrupt the bounded state file.
+    const statePath = path.join(sessionsDir, sid, "bounded-state.json");
+    fs.writeFileSync(statePath, "{not valid json");
+
+    // Second manager must resume the outer session AND handle the corrupt
+    // bounded file by starting fresh — not by crashing.
+    const second = makeAppOnDir(sessionsDir);
+    const resumeRes = await postJson(second.app, `/sessions/${sid}/resume`, {});
+    expect(resumeRes.status).toBe(200);
+
+    // env should show empty bindings (fresh fallback).
+    const envRes = await postJson(second.app, `/sessions/${sid}/exec`, { command: "env" });
+    const envBody = (await envRes.json()) as { preview: { bindings: string[] } };
+    expect(envBody.preview.bindings).toEqual([]);
+  });
+
   it("session persistence: POST /resume when disabled returns NOT_IMPLEMENTED_V1", async () => {
     const { app, sessionsDir } = makeApp();
     cleanup = sessionsDir;

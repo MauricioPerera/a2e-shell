@@ -56,6 +56,15 @@ export interface Session {
   readonly redactor: Redactor;
   readonly expiresAt: Date;
   /**
+   * Absolute path of the directory that owns this session's `state.json`
+   * and transcript files. Null when persistence is off.
+   *
+   * Exposed for subsystems (e.g. the bounded-verb runtime) that want to
+   * persist their own side-state next to the core session file, without
+   * tangling with the PersistedSession schema. Added in v1.2-rc.1.
+   */
+  readonly persistDir: string | null;
+  /**
    * The CURRENT transcript segment. After rotation this points to the
    * newly-opened file; consumers that need full history must use
    * `readFullTranscript()`.
@@ -227,6 +236,9 @@ export function createSession(init: SessionInit): Session {
     policy: init.policy,
     redactor: init.redactor,
     expiresAt: init.expires_at,
+    // Null when persistence is off — bounded runtime uses this to decide
+    // whether to write its side-file state.
+    persistDir: init.persistenceEnabled ? path.dirname(init.transcript_path) : null,
     // Getter so callers always see the CURRENT segment after rotation,
     // not the captured-at-create-time reference.
     get transcript() { return transcript; },
