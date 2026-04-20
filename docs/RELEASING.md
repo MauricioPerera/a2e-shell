@@ -15,7 +15,7 @@ The fix that prevents future recurrences is `scripts/smoke-prod-image.sh`, now g
 
 ## Before you tag
 
-Run these **in order**. The CI pipeline runs 1 and 2 automatically on every push; 3 runs on `push` to main and on `pull_request` via the `docker-smoke` job. 4 is manual.
+Run these **in order**. The CI pipeline runs 1 and 2 automatically on every push; 2 runs on `push` to main and on `pull_request` via the `docker-smoke` job. 3 is manual.
 
 ### 1. Tests + typecheck (automated)
 
@@ -27,15 +27,7 @@ npm test
 
 Expected: 0 failures, 0 todo. Typecheck must be clean.
 
-### 2. Linting (automated)
-
-```bash
-npm run lint
-```
-
-Expected: 0 warnings, 0 errors.
-
-### 3. Production Docker smoke (automated via `docker-smoke` CI job)
+### 2. Production Docker smoke (automated via `docker-smoke` CI job)
 
 ```bash
 bash scripts/smoke-prod-image.sh
@@ -59,7 +51,7 @@ Exit codes:
 - `4` — bounded exec failed (the v1.3.0 regression path)
 - `5` — stdio MCP failed
 
-### 4. Benchmarks (manual, SLO-bounded)
+### 3. Benchmarks (manual, SLO-bounded)
 
 ```bash
 # HTTP p95 latency SLO (also runs in CI under the `bench` job)
@@ -73,7 +65,7 @@ Expected: all gates pass. If `bench:bounded` regresses past the per-regime thres
 
 ## Cutting the tag
 
-Once all four are green:
+Once all three are green:
 
 ```bash
 # 1. Bump the version

@@ -17,7 +17,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   InterpStr,
   ListLit,
-  Literal,
   ObjectLit,
   Operand,
   PathRef,
@@ -284,9 +283,4 @@ function noImplicitItem(): A2EError {
     "SCOPE_MISS",
     "implicit field path (starting with '.') has no item context here",
   );
-}
-
-// Used by transform/merge to normalise a Literal-only list without session.
-export function evalLiteral(lit: Literal): RuntimeValue {
-  return evalValue(lit, { session: null as unknown as Session });
 }

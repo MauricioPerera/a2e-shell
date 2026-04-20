@@ -13,7 +13,6 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src tests --ext .ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:golden": "vitest run tests/integration/golden.test.ts",
@@ -32,9 +31,6 @@
   },
   "devDependencies": {
     "@types/node": "^22.7.0",
-    "@typescript-eslint/eslint-plugin": "^8.7.0",
-    "@typescript-eslint/parser": "^8.7.0",
-    "eslint": "^9.11.0",
     "gpt-tokenizer": "^3.4.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",

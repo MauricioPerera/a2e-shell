@@ -360,6 +360,12 @@ function spawnCapped(
       if (c.length > remaining) {
         stdoutChunks.push(c.subarray(0, remaining));
         stdoutTotal = maxResponseBytes;
+        // Kill the subprocess as soon as stdout hits the cap. Without this,
+        // a runaway CLI keeps writing to a full pipe until the timeout timer
+        // fires — wasted CPU + risk of OS pipe buffer saturation. SIGKILL
+        // skips any graceful cleanup the child might do; acceptable for
+        // "you exceeded the output budget" scenarios.
+        try { child.kill("SIGKILL"); } catch { /* ignore */ }
       } else {
         stdoutChunks.push(c);
         stdoutTotal += c.length;
