@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { runBenchmark } from "../benchmarks/bounded-vs-a2e-json.js";
+import { runBenchmark, TOKENIZERS } from "../benchmarks/bounded-vs-a2e-json.js";
 
 describe("RFC §6 — token-cost gates", () => {
   it("bench runs and produces a metric per trace", async () => {
@@ -60,5 +60,53 @@ describe("RFC §6 — token-cost gates", () => {
     const ratio = (bounded / a2e) * 100;
     // Empirical: ~32%. Gate at 50%.
     expect(ratio).toBeLessThanOrEqual(50);
+  });
+});
+
+/**
+ * Cross-tokenizer stability gate. Runs every trace under both encoders and
+ * asserts the ratio drift is small. If it drifts >5pp, the win might be an
+ * artifact of how cl100k_base specifically segments the canonical wrapper
+ * strings — i.e. a measurement bug, not a real efficiency gain.
+ *
+ * Empirical observation (v1.2-rc.1): drift is 0.1–0.9pp across all four
+ * traces. 5pp is a ~5x safety margin; a real tokenizer-specific artifact
+ * would trip this quickly.
+ */
+describe("RFC §6 — cross-tokenizer stability", () => {
+  const tokenizerNames = Object.keys(TOKENIZERS) as Array<keyof typeof TOKENIZERS>;
+
+  it(`at least two tokenizers are available (got ${tokenizerNames.join(", ")})`, () => {
+    expect(tokenizerNames.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("per-trace ratio drift ≤ 5pp between cl100k_base and o200k_base", async () => {
+    const cl = await runBenchmark("cl100k_base");
+    const o200 = await runBenchmark("o200k_base");
+    expect(cl.length).toBe(o200.length);
+    const offenders: string[] = [];
+    for (const c of cl) {
+      const match = o200.find((r) => r.name === c.name);
+      expect(match, `missing ${c.name} in o200k results`).toBeDefined();
+      const drift = Math.abs(c.ratio_pct - match!.ratio_pct);
+      if (drift > 5) {
+        offenders.push(`${c.name}: ${drift.toFixed(1)}pp (cl=${c.ratio_pct.toFixed(1)}%, o200=${match!.ratio_pct.toFixed(1)}%)`);
+      }
+    }
+    expect(offenders, `trace drift > 5pp: ${offenders.join("; ")}`).toEqual([]);
+  });
+
+  it("aggregate ratio drift ≤ 3pp between tokenizers", async () => {
+    const cl = await runBenchmark("cl100k_base");
+    const o200 = await runBenchmark("o200k_base");
+    const agg = (rs: typeof cl): number => {
+      const b = rs.reduce((a, r) => a + r.bounded_total, 0);
+      const a = rs.reduce((acc, r) => acc + r.a2e_total, 0);
+      return (b / a) * 100;
+    };
+    const drift = Math.abs(agg(cl) - agg(o200));
+    // Aggregate drift is tighter than per-trace because individual tokenizer
+    // quirks partially cancel across traces. Empirical: ~0.3pp.
+    expect(drift).toBeLessThanOrEqual(3);
   });
 });

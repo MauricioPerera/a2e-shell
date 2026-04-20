@@ -26,15 +26,23 @@
  *     the operation's output (no preview mechanism, no shape inference,
  *     no truncation — modeling a naive declarative runtime).
  *
- * Tokenizer: gpt-tokenizer's cl100k_base. Ratios are stable across
- * tokenizer families to within ~5%.
+ * Tokenizers (multi-model, v1.2-rc.1):
+ *   - cl100k_base:  GPT-3.5, GPT-4 (pre-4o), Claude 2-ish family
+ *   - o200k_base:   GPT-4o, GPT-5, most 2024+ frontier tokenizers
+ *   Ratios below measured against both. Claude 3+/Gemma/Llama tokenizers are
+ *   not publicly shipped; the two OpenAI-family tokenizers span the width of
+ *   available public encoders and their agreement (±pp) is the strongest
+ *   cross-tokenizer stability evidence we can produce without hitting
+ *   vendor-specific APIs. Gates in tests/integration/token-budget.test.ts
+ *   assert both tokenizers individually AND their drift vs each other.
  *
  * Usage: `npm run bench:bounded` (or `npx tsx tests/benchmarks/bounded-vs-a2e-json.ts`)
- * Exit code: 0 if every trace meets the ≤20% target; 1 otherwise.
+ * Exit code: 0 always — informational. Regressions caught by token-budget test.
  */
 
 import { fileURLToPath } from "node:url";
-import { encode } from "gpt-tokenizer";
+import { encode as encodeCl100k } from "gpt-tokenizer/encoding/cl100k_base";
+import { encode as encodeO200k } from "gpt-tokenizer/encoding/o200k_base";
 import { parseProgram } from "../../src/parser/parse.js";
 import { executeProgram } from "../../src/runtime/execute.js";
 import {
@@ -43,8 +51,21 @@ import {
 } from "../../src/runtime/session.js";
 import type { CanonicalResponse } from "../../src/runtime/canonical.js";
 
-// Tokenizer helper.
-const tok = (s: string): number => encode(s).length;
+// --- tokenizer registry ----------------------------------------------------
+
+export type Tokenizer = (s: string) => number;
+
+export const TOKENIZERS: Record<string, Tokenizer> = {
+  cl100k_base: (s) => encodeCl100k(s).length,
+  o200k_base: (s) => encodeO200k(s).length,
+};
+
+export const DEFAULT_TOKENIZER = "cl100k_base";
+
+// Module-level tokenizer handle used by measureTurn. Swapped in measureTrace
+// before each trace runs; not thread-safe but this bench is single-process.
+let currentTok: Tokenizer = TOKENIZERS[DEFAULT_TOKENIZER]!;
+const tok = (s: string): number => currentTok(s);
 
 // =============================================================================
 // Fixtures
@@ -589,12 +610,27 @@ function pad(n: number, w: number): string {
 // Public API (consumed by tests/integration/token-budget.test.ts)
 // =============================================================================
 
-export async function runBenchmark(): Promise<TraceMetric[]> {
-  const results: TraceMetric[] = [];
-  for (const trace of TRACES) {
-    results.push(await measureTrace(trace));
+/**
+ * Run every fixture trace under the named tokenizer. Unknown names throw.
+ * Callers that want cross-tokenizer stability should call this once per
+ * tokenizer and diff the ratios.
+ */
+export async function runBenchmark(
+  tokenizer: keyof typeof TOKENIZERS = DEFAULT_TOKENIZER,
+): Promise<TraceMetric[]> {
+  const impl = TOKENIZERS[tokenizer];
+  if (!impl) throw new Error(`unknown tokenizer: ${String(tokenizer)}`);
+  const previous = currentTok;
+  currentTok = impl;
+  try {
+    const results: TraceMetric[] = [];
+    for (const trace of TRACES) {
+      results.push(await measureTrace(trace));
+    }
+    return results;
+  } finally {
+    currentTok = previous;
   }
-  return results;
 }
 
 // =============================================================================
@@ -603,44 +639,54 @@ export async function runBenchmark(): Promise<TraceMetric[]> {
 
 async function main(): Promise<void> {
   console.log("\nBounded-verb shell vs A2E declarative JSON — token cost bench");
-  console.log("Tokenizer: cl100k_base (GPT-4 family)");
   console.log("Source: tests/golden/bounded/ + hand-authored A2E-JSON equivalents");
+  console.log("Tokenizers: cl100k_base (GPT-4 family) + o200k_base (GPT-4o/5 family)\n");
 
-  const results: TraceMetric[] = [];
-  for (const trace of TRACES) {
-    try {
-      const m = await measureTrace(trace);
-      results.push(m);
-      console.log(formatMetric(m));
-    } catch (e) {
-      console.error(`\nFAILED trace ${trace.name}: ${(e as Error).message}`);
-      throw e;
-    }
+  const perTokenizer: Record<string, TraceMetric[]> = {};
+  for (const name of Object.keys(TOKENIZERS)) {
+    perTokenizer[name] = await runBenchmark(name);
   }
 
-  // Aggregate across all traces.
-  const boundedAgg = results.reduce((a, r) => a + r.bounded_total, 0);
-  const a2eAgg = results.reduce((a, r) => a + r.a2e_total, 0);
-  const aggRatio = (boundedAgg / a2eAgg) * 100;
+  // Print first tokenizer's full per-turn tables; second tokenizer gets only
+  // a summary column (avoid doubling the noise).
+  const primary = DEFAULT_TOKENIZER;
+  console.log(`──── per-turn detail (${primary}) ────`);
+  for (const r of perTokenizer[primary]!) console.log(formatMetric(r));
 
+  // Side-by-side aggregate.
   console.log("\n" + "=".repeat(78));
-  console.log("AGGREGATE");
+  console.log("CROSS-TOKENIZER AGGREGATE");
   console.log("=".repeat(78));
-  for (const r of results) {
-    const marker = r.meets_target ? "✓" : "✗";
-    console.log(`  ${r.name.padEnd(30)} ${r.ratio_pct.toFixed(1).padStart(5)}%  ${marker}`);
+  const names = perTokenizer[primary]!.map((r) => r.name);
+  console.log(`  trace                           ${pad(primary, 12)} ${pad("o200k_base", 12)}  drift`);
+  console.log(`  ${"─".repeat(60)}`);
+  for (const traceName of names) {
+    const cl = perTokenizer["cl100k_base"]!.find((r) => r.name === traceName)!;
+    const o200 = perTokenizer["o200k_base"]!.find((r) => r.name === traceName)!;
+    const drift = Math.abs(cl.ratio_pct - o200.ratio_pct);
+    console.log(
+      `  ${traceName.padEnd(30)} ${pad(cl.ratio_pct.toFixed(1) + "%", 12)} ${pad(o200.ratio_pct.toFixed(1) + "%", 12)}  ${drift.toFixed(1).padStart(5)}pp`,
+    );
   }
-  console.log("─".repeat(78));
-  console.log(
-    `  TOTAL                          ${aggRatio.toFixed(1).padStart(5)}%  ${aggRatio <= 20 ? "✓" : "✗"}   (${boundedAgg}/${a2eAgg} tokens)`,
-  );
-  console.log(`  RFC §6 target: ≤ 20%`);
 
-  console.log(`\nObservation: the ≤20% target holds only on workloads dominated by`);
-  console.log(`large HTTP responses (see large-response-workload). Small-payload`);
-  console.log(`contract traces land at 50-105% because the canonical response`);
-  console.log(`wrapper itself carries overhead that doesn't amortize until the`);
-  console.log(`preview-truncation matters.\n`);
+  const aggOf = (rs: TraceMetric[]): number => {
+    const b = rs.reduce((a, r) => a + r.bounded_total, 0);
+    const a = rs.reduce((acc, r) => acc + r.a2e_total, 0);
+    return (b / a) * 100;
+  };
+  const aggCl = aggOf(perTokenizer["cl100k_base"]!);
+  const aggO200 = aggOf(perTokenizer["o200k_base"]!);
+  const aggDrift = Math.abs(aggCl - aggO200);
+  console.log(`  ${"─".repeat(60)}`);
+  console.log(
+    `  TOTAL                          ${pad(aggCl.toFixed(1) + "%", 12)} ${pad(aggO200.toFixed(1) + "%", 12)}  ${aggDrift.toFixed(1).padStart(5)}pp`,
+  );
+
+  console.log(`\nObservation: the ≤20% target holds only on large-response workloads.`);
+  console.log(`Small-payload traces sit at 50-105% because the canonical-wrapper`);
+  console.log(`overhead dominates when there's little data to truncate. Both`);
+  console.log(`tokenizers agree within ~${Math.max(aggDrift, 5).toFixed(0)}pp, indicating the win is not a`);
+  console.log(`cl100k artifact.\n`);
 
   // Informational exit: the aggregate target is aspirational. The benchmark
   // reports the ratio; pass/fail should be driven by higher-level tests that

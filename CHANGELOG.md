@@ -32,13 +32,15 @@ Shipped as an ampliation RFC — see [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT
 
 The RFC originally claimed "≤20% tokens universal". Measurement refined this to three regimes:
 
-| Trace | Regime | Ratio |
-|---|---|---:|
-| `large-response-workload` (synthetic, ≥2KB responses) | large | **14%** |
-| `call-filter-transform` (mixed ~600B responses) | medium | **53%** |
-| `foreach-save-merge` (small payloads <200B) | small | 104% |
-| `if-wait-history` (small payloads <200B) | small | 106% |
-| **Aggregate** | | **32%** |
+| Trace | Regime | cl100k_base | o200k_base | drift |
+|---|---|---:|---:|---:|
+| `large-response-workload` (synthetic, ≥2KB responses) | large | **14.0%** | **14.1%** | 0.1pp |
+| `call-filter-transform` (mixed ~600B responses) | medium | **52.4%** | **52.9%** | 0.5pp |
+| `foreach-save-merge` (small payloads <200B) | small | 103.8% | 103.5% | 0.3pp |
+| `if-wait-history` (small payloads <200B) | small | 106.5% | 105.6% | 0.9pp |
+| **Aggregate** | | **31.9%** | **32.2%** | 0.3pp |
+
+Cross-tokenizer drift is 0.1–0.9pp per trace (0.3pp aggregate), confirming the win is NOT an artifact of cl100k_base's specific segmentation. Both OpenAI-family encoders (covering GPT-3.5/4 and GPT-4o/5) agree on the efficiency claim within noise. Gates: see `tests/integration/token-budget.test.ts` — ≤5pp drift per trace, ≤3pp aggregate.
 
 **Finding**: bounded wins on large responses (preview truncation amortizes) and matches parity on small responses (canonical-wrapper overhead dominates when there's nothing big to truncate). The method is a **large-response optimizer**, not a universal compressor. CHANGELOG + RFC + README all reflect this.
 
@@ -83,7 +85,7 @@ Previously the flag parsed but iterations ran sequentially. rc.1 ships real conc
 
 ### Tests
 
-360 passed across 22 files. Typecheck clean.
+363 passed across 22 files. Typecheck clean.
 
 ### Migration
 

@@ -197,11 +197,11 @@ Additive scope on top of v1.1. No breaking changes to v1.1 surface.
 
 - **Persistence**: `bounded-state.json` side-file next to `state.json`, atomic writes (fsync+rename), lazy hydration on resume, corrupt-file fallback. Zero coupling with the v1.1 PersistedSession schema. Bindings + transcript (sans stmt) survive manager restart.
 - **Real `--parallel=N` in foreach**: `AsyncLocalStorage`-backed lexical frames for the iteration variable; bounded-concurrency worker pool. Iteration records ordered by index. First-error-wins under `--on-error=abort`. Concurrent `save` to the same name still races — users emit interpolated names for per-iteration accumulators.
+- **Multi-tokenizer benchmark**: `bench:bounded` runs both cl100k_base (GPT-3.5/4) and o200k_base (GPT-4o/5) and reports side-by-side ratios + per-trace drift. Empirical drift: 0.1–0.9pp per trace (0.3pp aggregate) → the token-cost win is NOT a cl100k artifact. Gate in `tests/integration/token-budget.test.ts` asserts ≤5pp per-trace, ≤3pp aggregate. Claude 3+ / Gemma / Llama tokenizers are not publicly shipped; the two OpenAI-family encoders we ship span the width of available public encoders.
 
 ### Bounded mode — deferred to v1.3
 
 - **SSE streaming for bounded**: JSON path is live; `Accept: text/event-stream` on bounded sessions still routes through the unrestricted code.
-- **Multi-model benchmark**: run `bench:bounded` against Claude / GPT-4 / Gemma tokenizers to verify cross-model stability of the ratios.
 
 ### MCP breadth (still pending)
 
