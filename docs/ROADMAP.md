@@ -147,7 +147,7 @@ Final rc: [v1.0.0-rc.3](https://github.com/MauricioPerera/a2e-shell/releases/tag
 
 ## v1.1 — MCP gateway (inbound) — **shipped**
 
-**Current tag: [v1.1.0](https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0)**.
+**Release tag: [v1.1.0](https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0)**. Superseded by v1.2 / v1.3 (additive, no breaking changes).
 
 a2e-shell is a token-disciplined MCP client. Sessions accept an `mcp_servers` array; connected servers' tools, resources, and prompts are exposed to the agent via the same canonical response format used for bash exec. Benchmark (95.9% token reduction vs naive MCP client on a realistic 3-turn agent task) ships with the release.
 
@@ -201,13 +201,13 @@ Additive scope on top of v1.1. No breaking changes to v1.1 surface. Tag: `v1.2.0
 
 ---
 
-## v1.3 — MCP breadth — **shipped (rc.1)**
+## v1.3 — MCP breadth — **shipped (GA)**
 
-**Theme**: close the MCP gap that v1.1 left open. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](rfcs/002-mcp-stdio-and-breadth.md). Tag: `v1.3.0-rc.1`.
+**Theme**: close the MCP gap that v1.1 left open. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](rfcs/002-mcp-stdio-and-breadth.md). Current tag: `v1.3.2` (rc.1 → GA → v1.3.1 peggy-as-dep hotfix → v1.3.2 grammar.pegjs-in-dist hotfix).
 
 Additive on top of v1.2. No breaking changes to v1.1/v1.2 surface.
 
-### Shipped in rc.1
+### Shipped in v1.3
 
 - **stdio transport for MCP servers**: subprocess + line-framed JSON-RPC. Lifecycle EOF → SIGTERM(2s) → SIGKILL(5s). Binary allowlist enforced. Crash → next `tools/call` returns `MCP_SERVER_UNREACHABLE`. No auto-restart in v1.3.
 - **`Mcp-Session-Id` threading**: capture on initialize, echo on every subsequent request (including `notifications/initialized`). Rotated ids adopted transparently. Invalid ids (400 with session-id-shaped body) trigger one retry without the header. SHA-8 hash logs, never raw.

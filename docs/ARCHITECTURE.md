@@ -7,26 +7,51 @@ Internal module layout, request lifecycle, security model, and failure modes.
 ```
 src/
 ├── index.ts                     entry: env parse, TLS opt-in, cache init, manager init, app build, listen, SIGTERM/SIGINT shutdown
-├── errors.ts                    ErrorCode enum (incl. SERVICE_UNAVAILABLE), A2EError class, httpStatusForCode table
+├── errors.ts                    ErrorCode enum, A2EError class, httpStatusForCode table (incl. MCP_* codes from v1.1/v1.3)
 ├── http/
 │   ├── server.ts                Hono app build, middleware stack, onError serializer, API_VERSION constant
 │   ├── lifecycle.ts             accepting → draining → stopped state machine, in-flight counter, waitForDrain
 │   └── routes/
-│       ├── sessions.ts          POST /sessions, DELETE /sessions/:id, POST /sessions/:id/resume (experimental)
+│       ├── sessions.ts          POST /sessions (mode + mcp_servers + catalog), DELETE /sessions/:id, POST /sessions/:id/resume
 │       ├── exec.ts              POST /sessions/:id/exec + SSE streaming variant + idempotency + post-response flush
 │       ├── state.ts             GET /state, PATCH /cwd, PATCH /env, GET /transcript
 │       └── replay.ts            POST /sessions/:id/replay
 ├── session/
-│   ├── manager.ts               registry of live sessions, create+resume+get+delete+sweep
-│   ├── state.ts                 Session factory: cwd, env overlay, bindings, idempotency cache, transcript rotation, persistence orchestration
+│   ├── manager.ts               registry of live sessions, create+resume+get+delete+sweep, connectMcp dispatch
+│   ├── state.ts                 Session factory: cwd, env overlay, bindings, idempotency cache, transcript rotation, persistence orchestration, persistDir accessor (v1.2)
 │   ├── persistence.ts           atomic state.json writes (tmp + fsync + rename), schema-versioned read path
 │   ├── transcript.ts            JSONL append-only, read iterator, hashFinal
 │   └── validation.ts            shared validators for cwd (realpath symlink check), env, reserved keys (create + PATCH)
 ├── exec/
-│   ├── pipeline.ts              orchestrator for a single turn; returns TurnResult {response, outcome}
-│   ├── interpolate.ts           ${$var} resolver with strict regex (single pass, no recursion)
+│   ├── pipeline.ts              orchestrator for a single turn; routes to bash or bounded runtime based on session.policy.mode
+│   ├── pipeline-bounded.ts      v1.2 bridge: outer Session ↔ BoundedRuntimeSession (WeakMap-backed), persist on turn, lazy hydrate on resume
+│   ├── interpolate.ts           ${$var} resolver with strict regex (single pass, no recursion) — unrestricted mode
 │   ├── state-intercept.ts       cd/export/unset classifier (pure)
 │   └── run.ts                   spawn BASH_PATH -c with argv-array, streaming truncation, stream-mode TextDecoder
+├── parser/                      ← v1.2: bounded-verb grammar
+│   ├── grammar.pegjs            peggy source (EBNF in docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md)
+│   ├── parse.ts                 runtime parseProgram + R2/R5/R7 enforcement + AST typing
+│   └── ast.ts                   typed AST nodes (discriminated unions)
+├── runtime/                     ← v1.2: bounded-verb dispatcher
+│   ├── session.ts               BoundedRuntimeSession, Binding, transcript, TTL sweep
+│   ├── canonical.ts             CanonicalResponse builder + shape inference + preview truncation
+│   ├── evaluate.ts              evalValue + evalPredicate + withPushedFrame (AsyncLocalStorage for foreach parallelism)
+│   ├── execute.ts               dispatcher AST → CanonicalResponse + block re-entry + Semaphore-bound concurrency
+│   └── persist.ts               bounded-state.json serialize/deserialize (atomic + Buffer base64 encoding)
+├── verbs/                       ← v1.2: one file per verb
+│   ├── call.ts                  HTTP + CLI (domain allowlist + SIGKILL + UTF-8/Buffer auto-detect)
+│   ├── filter.ts | transform.ts | save.ts | wait.ts | merge.ts
+├── meta/                        ← v1.2: describe | head | show | env | history | help
+├── mcp/                         ← v1.1 + v1.3: MCP gateway
+│   ├── schema.ts                McpServerSpec discriminated union on transport (http | sse | stdio)
+│   ├── client.ts                HTTP + SSE transport client (v1.1) with Mcp-Session-Id threading (v1.3)
+│   ├── stdio-client.ts          stdio transport client (v1.3): spawn + line-framed JSON-RPC + EOF→SIGTERM→SIGKILL lifecycle
+│   ├── connect.ts               transport-agnostic dispatcher (v1.3)
+│   ├── rate-limit.ts            sliding-60s-window per-server rate limiter (v1.3)
+│   ├── invoke.ts                /bin/mcp-invoke virtual command
+│   ├── reachability.ts          exposes MCP tools/resources/prompts to catalog reachability report
+│   ├── sse.ts                   SSE stream parser
+│   └── types.ts                 JSON-RPC + MCP result types
 ├── capabilities/
 │   └── policy.ts                policy resolver + enforceBinaryAllowlist + isBinaryReachable
 ├── credentials/
@@ -40,8 +65,8 @@ src/
 ├── metrics/
 │   └── metrics.ts               prom-client registry: http, exec, sessions, catalog, rate limits, redactor, transcript
 └── io/
-    ├── protocol.ts              ALL Zod schemas (requests, responses, catalog, auth)
-    └── format.ts                canonical ExecResponse builder, shape detector
+    ├── protocol.ts              ALL Zod schemas (requests, responses, catalog, auth, mcp_servers)
+    └── format.ts                canonical ExecResponse builder, shape detector (unrestricted mode)
 ```
 
 ## Request lifecycle
@@ -266,8 +291,14 @@ SIGTERM / SIGINT
 - **Cache tests** invoke real `git` via `sh`. On Windows, `tests/setup.ts` resolves Git-for-Windows bash.
 - **Benchmarks** (`tests/benchmarks/`): `http.bench.ts` (p95 SLO gate, runs in CI) and `tokens.ts` (prompt-token savings vs raw dump).
 
-Total: **133 tests**, ~20s. CI runs typecheck + full suite + bench on every PR.
+Total: **384 tests** (v1.3), ~30s. CI runs typecheck + full suite + bench + docker-smoke on every PR.
 
 ## Version
 
-**v1.0.0-rc.3**. Schema lock in effect: HTTP routes, response headers, error codes, and env var names are a stable contract. Additive changes land as minors; breaking changes ship under `/v2/*`. See [CHANGELOG.md](../CHANGELOG.md) for the frozen surface per release.
+**v1.3.2** (current stable). Schema lock from v1.0 remains in effect: HTTP routes, response headers, error codes, and env var names are a stable contract. Additive changes land as minors:
+
+- **v1.1** — MCP gateway (inbound): HTTP/SSE transports, `mcp_servers` session field
+- **v1.2** — Bounded-verb shell: `mode: "bounded"`, closed-grammar DSL, persistence, parallel foreach
+- **v1.3** — MCP breadth: stdio transport, `Mcp-Session-Id` threading, per-server rate limits
+
+Breaking changes ship under `/v2/*`. See [CHANGELOG.md](../CHANGELOG.md) for the frozen surface per release.

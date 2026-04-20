@@ -70,10 +70,10 @@ Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`,
 
 ```ts
 {
-  mode?: "unrestricted" | "bounded",    // default "unrestricted" (bounded = v2)
+  mode?: "unrestricted" | "bounded",    // default "unrestricted"; "bounded" shipped in v1.2
   capabilities?: {
     binaries_allowlist?: string[],
-    http_domains_allowlist?: string[],  // stored, not enforced in v1
+    http_domains_allowlist?: string[],  // enforced by bounded `call` (v1.2); stored for unrestricted
     max_exec_timeout_ms?: number,
     max_response_bytes?: number,
     max_session_ttl_s?: number
@@ -93,7 +93,27 @@ Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`,
       key_path_env_var: string,
       known_hosts_env_var?: string
     }
-  }
+  },
+  mcp_servers?: Array<                  // v1.1 + v1.3: connect external MCP servers
+    | {                                 //   HTTP / SSE transport (v1.1)
+        id: string,                     //   /^[a-z][a-z0-9_-]{0,31}$/
+        transport?: "http" | "sse",     //   default "http"
+        url: string,                    //   absolute; CF/proxy-fronted OK
+        auth?: { type: "token", env_var: string, scheme?: string, header?: string },
+        timeout_ms?: number,            //   default 30_000
+        rate_limit_rpm?: number         //   v1.3; default 600; 0 = disabled
+      }
+    | {                                 //   stdio transport (v1.3)
+        id: string,
+        transport: "stdio",
+        command: string,                //   absolute path or bare name (allowlist-checked)
+        args?: string[],
+        env?: Record<string, string>,   //   overlay on process env
+        cwd?: string,
+        timeout_ms?: number,
+        rate_limit_rpm?: number
+      }
+  >                                     //   max 8 servers per session
 }
 ```
 
@@ -119,7 +139,16 @@ Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`,
       report_path: string               // points to catalog/reachability.json
     },
     mirror_path: string | null          // null in direct-clone mode
-  }
+  },
+  mcp_servers: Array<{                  // v1.1 + v1.3; [] if no servers requested
+    id: string,
+    url: string,                        // HTTP url for http/sse, "stdio://<command>" for stdio
+    protocol_version: string,           // e.g. "2025-06-18"
+    tools_count: number,
+    resources_count: number,
+    prompts_count: number,
+    server_info: { name: string, version: string } | null
+  }>
 }
 ```
 
@@ -149,20 +178,24 @@ On bootstrap failure, the session is NOT registered and the partial dir on disk 
 
 ### Response — `200 OK`
 
+The canonical response shape is stable across modes, but the `status_line` format differs:
+
 ```ts
 {
-  status_line: string,                  // "[exit N]" | "[error: CODE]"
-  shape: string | null,                 // "json<T>[N]" | "jsonl[N]" | "text[Nb]" | "binary[Nb]" | null
-  preview: unknown | null,              // first policy.preview_bytes of stdout (truncated)
-  binding: string | null,               // "$<name>" if bind_as captured
-  stderr: string | null,                // first policy.stderr_preview_bytes of stderr, or null
-  truncated: boolean,                   // true if stdout was cut at max_response_bytes
+  status_line: string,                  // unrestricted: "[exit N]" | "[error: CODE]"
+                                        // bounded (v1.2):  "OK | <verb> → <shape> in <ms>ms" | "ERR | <CODE>"
+  shape: string | null,                 // unrestricted: "json<T>[N]" | "jsonl[N]" | "text[Nb]" | "binary[Nb]" | null
+                                        // bounded:        "scalar[NB]" | "record[Nkeys]" | "list[N]" | "table[NxM]" | "bytes[NB]" | null
+  preview: unknown | null,              // first policy.preview_bytes of output (truncated) — string for unrestricted, structured for bounded
+  binding: string | null,               // "$<name>" if bound (via bind_as in unrestricted, via assignment `$x = ...` in bounded)
+  stderr: string | null,                // first policy.stderr_preview_bytes of stderr, or null (bounded: always null on success)
+  truncated: boolean,                   // true if output was cut at max_response_bytes
   idempotent_hit?: boolean,             // present and true on cache hits
   error?: { code: ErrorCode, message: string }
 }
 ```
 
-### Exec semantics
+### Exec semantics — unrestricted mode (default)
 
 1. **Interpolation**: `${$name}` tokens in `command` and `stdin` are resolved from the session's bindings. Any other `${...}` form → `INTERPOLATION_REJECTED`. Missing name → `SCOPE_MISS`.
 2. **Intercepts**: commands that trim to exactly `cd <path>`, `export KEY=VALUE`, or `unset KEY [...]` mutate session state without spawning. Compound commands (`cd /x && ls`) do spawn — state change dies with subprocess.
@@ -172,6 +205,17 @@ On bootstrap failure, the session is NOT registered and the partial dir on disk 
 6. **Formatter**: produces the canonical response.
 7. **Binding**: on `exit 0` with `bind_as`, captures the full redacted stdout. Throws `SIZE_LIMIT` if the binding would exceed `max_binding_bytes`, `max_total_binding_bytes`, or `max_bindings`.
 8. **Transcript**: serialized entry + redactor pass + JSONL append.
+
+### Exec semantics — bounded mode (v1.2)
+
+1. **Parse**: `command` is parsed against the closed grammar (8 verbs + 6 meta). Invalid syntax → `PARSE_ERROR`. `${$var}` only accepts path references per grammar rule R2; everything else → `INTERPOLATION_REJECTED`. `$_` reserved (R5).
+2. **No bash**: commands execute through the dispatcher in `src/runtime/execute.ts`. No subprocess except through the `call` verb (HTTP fetch or CLI spawn, both capability-gated).
+3. **Iteration**: `foreach --parallel=N` runs up to N iterations concurrently; `$item` is a lexical frame (AsyncLocalStorage), isolated per-iteration.
+4. **Binding**: assignment `$x = <verb>` or `save ... as <name>` both write to the session's binding map. Grammar rejects `$_ = ...` at parse time.
+5. **Persistence** (if `A2E_SESSION_PERSISTENCE=true`): bindings + transcript serialized to `bounded-state.json` beside `state.json` on every turn; hydrated on resume.
+6. **Transcript**: same JSONL append path as unrestricted — one entry per outer command (block bodies are NOT recorded separately).
+
+Spec: [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](rfcs/RFC-bounded-verb-shell-CONTRACT.md).
 
 ### Catalog env exposed to subprocess
 

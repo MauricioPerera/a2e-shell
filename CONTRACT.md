@@ -1,5 +1,13 @@
 # CONTRACT.md — a2e-shell
 
+> **Status**: this document is the **v1.0 baseline contract** — the acceptance spec the project was built against for the initial release. Subsequent releases are additive:
+>
+> - **v1.1** — MCP gateway (inbound). Session spec gains `mcp_servers` array; the agent can invoke MCP tools/resources/prompts through the same canonical response pipeline as bash exec. Spec: [`docs/rfcs/001-mcp-gateway.md`](docs/rfcs/001-mcp-gateway.md).
+> - **v1.2** — Bounded-verb shell. `mode: "bounded"` sessions execute a closed-grammar DSL (8 verbs + 6 meta) instead of bash. Spec: [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md).
+> - **v1.3** — MCP stdio transport + `Mcp-Session-Id` threading + per-server rate limits. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](docs/rfcs/002-mcp-stdio-and-breadth.md).
+>
+> For the **live, current API surface** see [`docs/API.md`](docs/API.md); for release-by-release history see [`CHANGELOG.md`](CHANGELOG.md); for forward planning see [`docs/ROADMAP.md`](docs/ROADMAP.md). Sections below that reference v1-only behavior (e.g. "mode=bounded reserved for v2") are historical — the current behavior lives in the docs above.
+
 ## 1. Objetivo
 
 Servidor HTTP que expone una shell real del sistema operativo como **tool primitiva** a cualquier agente LLM. Ofrece sesiones persistentes, output canónico tokenizado y capability scoping por allowlist. La superficie de capacidades se amplía instalando CLIs de terceros (`gh`, `aws`, `kubectl`, `jq`, `curl`, `git`, ...) en la imagen de despliegue — el agente los invoca como shell real, sin wrappers.
