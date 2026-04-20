@@ -90,6 +90,15 @@ services:
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/etc/grafana/provisioning/dashboards/a2e-shell-overview.json"
       GF_SERVER_HTTP_ADDR: "127.0.0.1"
       GF_SERVER_HTTP_PORT: "3000"
+      # Proxied behind nginx (grafana.ardf.dev → 127.0.0.1:3000). Grafana needs
+      # to know its external URL so absolute links, OAuth callbacks, and the
+      # "share" feature generate the right URLs. Override via env when deploying
+      # to a different hostname.
+      GF_SERVER_DOMAIN: "${GRAFANA_DOMAIN:-grafana.ardf.dev}"
+      GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-https://grafana.ardf.dev}"
+      # Trust X-Forwarded-Proto from the upstream so Grafana generates
+      # `https://` URLs even though the connection from nginx → grafana is plain HTTP.
+      GF_SERVER_ENFORCE_DOMAIN: "false"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q '\"database\":\"ok\"'"]
       interval: 30s

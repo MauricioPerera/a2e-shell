@@ -102,30 +102,45 @@ If you add more services (mcp-serve-catalog `/metrics` when it gains one, revers
 
 ## Exposing Grafana externally
 
-Default binding is `127.0.0.1:3000` — local access only. To expose externally, add an nginx vhost that proxies to `127.0.0.1:3000` and handles TLS. Sample nginx block:
+Two options:
 
-```nginx
-server {
-  server_name grafana.ardf.dev;
-  listen 443 ssl http2;
-  # ... cert + standard TLS config ...
+### Option A: Full public host (grafana.ardf.dev)
 
-  location / {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-  }
-}
+Use the ready-made nginx vhost in this directory (`nginx-grafana.conf`). Traffic path:
+
+```
+browser → Cloudflare (wildcard TLS *.ardf.dev) → VPS:443 → 127.0.0.1:3000
 ```
 
-Until then, SSH port-forward:
+Deployment:
+
+1. **Add a DNS record** at Cloudflare (zone `ardf.dev`):
+   - `Type: CNAME` · `Name: grafana` · `Target: ardf.dev` · `Proxy: ON (orange cloud)`
+   - Or `A` pointing to the VPS IP, also proxied.
+2. **Install the nginx vhost**:
+   ```bash
+   scp deploy/monitoring/nginx-grafana.conf root@<vps>:/etc/nginx/sites-available/grafana
+   ssh root@<vps> 'ln -sf /etc/nginx/sites-available/grafana /etc/nginx/sites-enabled/grafana && nginx -t && systemctl reload nginx'
+   ```
+3. **Restart Grafana** with the `GRAFANA_DOMAIN` / `GRAFANA_ROOT_URL` env vars set (they default to `grafana.ardf.dev` / `https://grafana.ardf.dev` — override if you picked a different hostname).
+
+Once DNS propagates (<5 min on Cloudflare):
+
+```bash
+curl -sSI https://grafana.ardf.dev/login
+# Expected: HTTP/2 200 + Server: cloudflare
+```
+
+Grafana's own auth (`admin` + the password set on first deploy) is the only access gate. Grafana ships with a built-in lockout after too many failed logins; no extra nginx-level basic auth is needed.
+
+### Option B: SSH port-forward (no DNS, no public exposure)
 
 ```bash
 ssh -L 3000:127.0.0.1:3000 root@<vps>
 # then open http://localhost:3000 in your browser
 ```
+
+This is the default for anything short of "I want to show this dashboard to someone without a VPS account".
 
 ## Retention & disk
 
