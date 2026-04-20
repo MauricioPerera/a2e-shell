@@ -24,6 +24,37 @@ export type RuntimeValue =
   | RuntimeValue[]
   | { [k: string]: RuntimeValue };
 
+/**
+ * Capability surface visible to `call`. The HTTP layer populates this from
+ * the resolved policy when creating the session. Defaults are RESTRICTIVE:
+ * no binaries, no HTTP domains — every `call` fails with CAPABILITY_DENIED
+ * unless the session was created with explicit allowlists.
+ *
+ * This is NOT a general session-policy container — it is only the narrow
+ * slice needed by call.ts. Other policy concerns (binding limits, response
+ * caps for the outer HTTP layer) live in capabilities/policy.ts.
+ */
+export interface CallCapabilities {
+  readonly binariesAllowlist: readonly string[];
+  /** "*" in the list acts as wildcard for any domain. */
+  readonly httpDomainsAllowlist: readonly string[];
+  readonly maxExecTimeoutMs: number;
+  readonly maxResponseBytes: number;
+  /** Absolute paths of resolved binaries, keyed by bare name. */
+  readonly binaryPaths: Readonly<Record<string, string>>;
+  /** PATH string used when spawning (already filtered by allowlist). */
+  readonly pathEnv: string;
+}
+
+export const RESTRICTIVE_CAPS: CallCapabilities = {
+  binariesAllowlist: [],
+  httpDomainsAllowlist: [],
+  maxExecTimeoutMs: 5_000,
+  maxResponseBytes: 256 * 1024,
+  binaryPaths: {},
+  pathEnv: "",
+};
+
 export interface Binding {
   readonly value: RuntimeValue;
   /** Monotonic time when this binding was created. Used by save ttl. */
@@ -44,6 +75,7 @@ export interface TranscriptEntry {
 
 export interface Session {
   readonly id: string;
+  readonly caps: CallCapabilities;
   bindings: Map<string, Binding>;
   last: Binding | null;
   transcript: TranscriptEntry[];
@@ -53,9 +85,10 @@ export interface Session {
 
 // --- constructors & accessors ----------------------------------------------
 
-export function createSession(id: string): Session {
+export function createSession(id: string, caps: CallCapabilities = RESTRICTIVE_CAPS): Session {
   return {
     id,
+    caps,
     bindings: new Map(),
     last: null,
     transcript: [],

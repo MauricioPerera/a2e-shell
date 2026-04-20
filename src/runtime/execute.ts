@@ -15,6 +15,8 @@
 import type {
   Assignment,
   FilterCmd,
+  ForeachBlock,
+  IfBlock,
   MergeCmd,
   MetaCall,
   Program,
@@ -32,14 +34,16 @@ import {
   canonicalVoid,
   type CanonicalResponse,
 } from "./canonical.js";
-import { evalValue } from "./evaluate.js";
+import { evalPredicate, evalValue } from "./evaluate.js";
 import {
+  bind,
   makeBinding,
   recordTurn,
   updateLast,
   type RuntimeValue,
   type Session,
 } from "./session.js";
+import { runCallCli, runCallHttp } from "../verbs/call.js";
 import { runFilter } from "../verbs/filter.js";
 import { runMerge } from "../verbs/merge.js";
 import { runSave } from "../verbs/save.js";
@@ -96,13 +100,117 @@ async function executeStmt(
   if (stmt.kind === "assignment") {
     return executeAssignment(session, stmt as Assignment, started);
   }
-  if (stmt.kind === "if" || stmt.kind === "foreach") {
-    throw new A2EError(
-      "NOT_IMPLEMENTED_V1",
-      `block verb '${stmt.kind}' not yet wired in this increment`,
-    );
+  if (stmt.kind === "if") {
+    return executeIfBlock(session, stmt as IfBlock, started);
+  }
+  if (stmt.kind === "foreach") {
+    return executeForeachBlock(session, stmt as ForeachBlock, started);
   }
   return executeCommand(session, stmt, null, started);
+}
+
+// -- block dispatch ----------------------------------------------------------
+
+async function executeIfBlock(
+  session: Session,
+  block: IfBlock,
+  started: number,
+): Promise<CanonicalResponse> {
+  const cond = evalPredicate(block.predicate, { session });
+  const branch = cond ? block.thenBody : (block.elseBody ?? []);
+  for (const stmt of branch) {
+    // Body stmts run for side effects. Errors propagate (no catch-and-continue
+    // here). Block-level bindings persist in session.
+    await executeStmt(session, stmt, Date.now());
+  }
+  const tag = `branch:${cond ? "then" : "else"}`;
+  updateLast(session, makeBinding(tag));
+  return canonicalOk({
+    verb: "if",
+    value: tag,
+    binding: null,
+    durationMs: Date.now() - started,
+  });
+}
+
+/**
+ * `foreach $item in <list> [--parallel=N] [--on-error=abort|continue] do ... end`.
+ *
+ * v0.1 semantics:
+ *   - `--parallel=N` is ACCEPTED but executes sequentially. The flag is
+ *     validated + stored on the AST; concurrent execution is deferred until
+ *     evalValue supports per-iteration scopes (would need to shadow the item
+ *     binding per task).
+ *   - `--on-error=continue` catches errors inside the body and records them
+ *     on the iteration record; `abort` (default) propagates the first error.
+ *
+ * Return value: list of `{iteration, last_verb, last_binding, error?}` records.
+ */
+async function executeForeachBlock(
+  session: Session,
+  block: ForeachBlock,
+  started: number,
+): Promise<CanonicalResponse> {
+  const list = evalValue(block.list, { session });
+  if (!Array.isArray(list)) {
+    throw new A2EError("PARSE_ERROR", `foreach: target must be list, got ${typeof list}`);
+  }
+
+  // Stash any existing binding for the iteration variable; restore at end.
+  const stashed = session.bindings.get(block.itemVar);
+  const results: Record<string, RuntimeValue>[] = [];
+
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i] as RuntimeValue;
+      bind(session, block.itemVar, makeBinding(item));
+      let lastVerb = "?";
+      let lastBinding: string | null = null;
+      let errorCode: string | null = null;
+      for (const stmt of block.body) {
+        try {
+          const r = await executeStmt(session, stmt, Date.now());
+          if (r.error) {
+            errorCode = r.error.code;
+            if (block.onError === "abort") {
+              throw new A2EError(r.error.code as never, r.error.message);
+            }
+            break;
+          }
+          lastVerb = verbNameOf(stmt);
+          lastBinding = r.binding;
+        } catch (e) {
+          if (block.onError === "abort") throw e;
+          errorCode = e instanceof A2EError ? e.code : "INTERNAL";
+          break;
+        }
+      }
+      const record: Record<string, RuntimeValue> = {
+        iteration: i,
+        last_verb: lastVerb,
+        last_binding: lastBinding,
+      };
+      if (errorCode !== null) record.error_code = errorCode;
+      results.push(record);
+    }
+  } finally {
+    if (stashed !== undefined) session.bindings.set(block.itemVar, stashed);
+    else session.bindings.delete(block.itemVar);
+  }
+
+  updateLast(session, makeBinding(results));
+  return canonicalOk({
+    verb: "foreach",
+    value: results,
+    binding: null,
+    durationMs: Date.now() - started,
+  });
+}
+
+function verbNameOf(stmt: Stmt): string {
+  if (stmt.kind === "assignment") return verbNameOf(stmt.rhs as Stmt);
+  if (stmt.kind === "call-http" || stmt.kind === "call-cli") return "call";
+  return stmt.kind;
 }
 
 async function executeAssignment(
@@ -139,12 +247,14 @@ async function executeVerb(
   started: number,
 ): Promise<CanonicalResponse> {
   switch (verb.kind) {
-    case "call-http":
-    case "call-cli":
-      throw new A2EError(
-        "NOT_IMPLEMENTED_V1",
-        `verb '${verb.kind}' not yet wired in this increment`,
-      );
+    case "call-http": {
+      const value = await runCallHttp(session, verb);
+      return finishAndBind(session, "call", value, bindingName, started);
+    }
+    case "call-cli": {
+      const value = await runCallCli(session, verb);
+      return finishAndBind(session, "call", value, bindingName, started);
+    }
 
     case "wait": {
       await runWait(verb as WaitCmd);

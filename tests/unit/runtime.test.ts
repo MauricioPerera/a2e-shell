@@ -1,10 +1,9 @@
 /**
  * End-to-end runtime tests: parse → dispatch → canonical response.
  *
- * Scope of this increment: all 6 meta + 5 pure-data verbs (wait, save, filter,
- * transform, merge). The `call` verb and blocks (if/foreach) deliberately
- * return NOT_IMPLEMENTED_V1 for now; those tests are explicit placeholders
- * that assert the dispatcher surface is there and typed.
+ * Scope: all 6 meta + 6 verbs (wait, save, filter, transform, merge, call).
+ * Blocks (if/foreach) still return NOT_IMPLEMENTED_V1 — those tests assert
+ * the dispatcher surface is there and typed.
  */
 
 import { describe, it, expect } from "vitest";
@@ -251,6 +250,113 @@ describe("runtime — merge", () => {
 });
 
 // ===========================================================================
+// blocks: if + foreach
+// ===========================================================================
+
+describe("runtime — if block", () => {
+  it("then branch taken on true predicate; body side effects persist", async () => {
+    const s = createSession("if1");
+    await run(s, "save 1 as n");
+    const r = okOf(await run(s, "if $n == 1 do\n  save 42 as taken\nend"));
+    expect(r.status_line).toMatch(/^OK \| if → scalar\[\d+B\] in \d+ms$/);
+    expect(JSON.parse(r.preview)).toBe("branch:then");
+    const showR = okOf(await run(s, "show $taken"));
+    expect(JSON.parse(showR.preview)).toBe(42);
+  });
+
+  it("else branch taken on false predicate", async () => {
+    const s = createSession("if2");
+    await run(s, "save 5 as n");
+    const r = okOf(await run(s, "if $n > 100 do\n  save \"hi\" as x\nelse\n  save \"lo\" as x\nend"));
+    expect(JSON.parse(r.preview)).toBe("branch:else");
+    const showR = okOf(await run(s, "show $x"));
+    expect(JSON.parse(showR.preview)).toBe("lo");
+  });
+
+  it("no else branch, false predicate → body skipped entirely", async () => {
+    const s = createSession("if3");
+    await run(s, "save 0 as n");
+    const r = okOf(await run(s, "if $n > 100 do\n  save 1 as dead\nend"));
+    expect(JSON.parse(r.preview)).toBe("branch:else");
+    const show = errOf(await run(s, "show $dead"));
+    expect(show.error.code).toBe("SCOPE_MISS");
+  });
+
+  it("predicate error surfaces as block error", async () => {
+    const s = createSession("if4");
+    // $missing not bound → SCOPE_MISS in predicate
+    const r = errOf(await run(s, "if $missing == 1 do\n  wait 1ms\nend"));
+    expect(r.error.code).toBe("SCOPE_MISS");
+  });
+});
+
+describe("runtime — foreach block", () => {
+  it("iterates over a list, body runs per item, result has iteration records", async () => {
+    const s = createSession("fe1");
+    await run(s, "save [10,20,30] as nums");
+    // --overwrite required to re-bind the same name each iteration.
+    const r = okOf(await run(s, "foreach $n in $nums do\n  save $n as last --overwrite\nend"));
+    // Shape is inferred as "table" because the 3 iteration records share keys.
+    expect(r.status_line).toMatch(/^OK \| foreach → table\[3x\d+\]/);
+    const rows = JSON.parse(r.preview.replace(/, \.\.\.\+\d+more\]$/, "]"));
+    expect(Array.isArray(rows)).toBe(true);
+    // Final iteration sets $last to 30.
+    const showR = okOf(await run(s, "show $last"));
+    expect(JSON.parse(showR.preview)).toBe(30);
+  });
+
+  it("iteration variable does not leak after block (restores prior binding if any)", async () => {
+    const s = createSession("fe2");
+    await run(s, "save 999 as item");
+    await run(s, "save [1,2] as xs");
+    await run(s, "foreach $item in $xs do\n  wait 1ms\nend");
+    const showR = okOf(await run(s, "show $item"));
+    // prior value restored
+    expect(JSON.parse(showR.preview)).toBe(999);
+  });
+
+  it("iteration variable deleted after block if it wasn't bound before", async () => {
+    const s = createSession("fe3");
+    await run(s, "save [1,2] as xs");
+    await run(s, "foreach $fresh in $xs do\n  wait 1ms\nend");
+    const r = errOf(await run(s, "show $fresh"));
+    expect(r.error.code).toBe("SCOPE_MISS");
+  });
+
+  it("empty list → zero iterations, empty result", async () => {
+    const s = createSession("fe4");
+    await run(s, "save [] as empty");
+    const r = okOf(await run(s, "foreach $x in $empty do\n  wait 1ms\nend"));
+    expect(JSON.parse(r.preview)).toEqual([]);
+  });
+
+  it("non-list target → PARSE_ERROR", async () => {
+    const s = createSession("fe5");
+    await run(s, "save 42 as n");
+    const r = errOf(await run(s, "foreach $x in $n do\n  wait 1ms\nend"));
+    expect(r.error.code).toBe("PARSE_ERROR");
+  });
+
+  it("--on-error=abort stops on first iteration error", async () => {
+    const s = createSession("fe6");
+    await run(s, "save [1,2,3] as xs");
+    // SCOPE_MISS inside body — default abort.
+    const r = errOf(await run(s, "foreach $x in $xs do\n  show $nope\nend"));
+    expect(r.error.code).toBe("SCOPE_MISS");
+  });
+
+  it("--on-error=continue records error_code per iteration and keeps going", async () => {
+    const s = createSession("fe7");
+    await run(s, "save [1,2] as xs");
+    const r = okOf(await run(s, "foreach $x in $xs --on-error=continue do\n  show $nope\nend"));
+    const rows = JSON.parse(r.preview);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].error_code).toBe("SCOPE_MISS");
+    expect(rows[1].error_code).toBe("SCOPE_MISS");
+  });
+});
+
+// ===========================================================================
 // cross-cutting: SCOPE_MISS + deferred verbs
 // ===========================================================================
 
@@ -268,16 +374,10 @@ describe("runtime — cross-cutting", () => {
     expect(r.error.code).toBe("SCOPE_MISS");
   });
 
-  it("call verb returns NOT_IMPLEMENTED_V1 (pending future increment)", async () => {
+  it("call without caps is denied (CAPABILITY_DENIED)", async () => {
     const s = createSession("ni1");
     const r = errOf(await run(s, 'call GET "https://x.com/"'));
-    expect(r.error.code).toBe("NOT_IMPLEMENTED_V1");
-  });
-
-  it("foreach block returns NOT_IMPLEMENTED_V1 (pending future increment)", async () => {
-    const s = createSession("ni2");
-    const r = errOf(await run(s, "foreach $x in [1,2] do\n  wait 1ms\nend"));
-    expect(r.error.code).toBe("NOT_IMPLEMENTED_V1");
+    expect(r.error.code).toBe("CAPABILITY_DENIED");
   });
 
   it("transcript records both OK and ERR turns monotonically", async () => {

@@ -270,14 +270,74 @@ describe("golden traces — bounded coverage aggregate", () => {
   });
 });
 
-describe("golden traces — bounded replay (pending runtime)", () => {
-  // Bounded runtime is not yet implemented (see RFC).
-  // When src/parser/ + src/verbs/ land, swap these todos for real replay
-  // that feeds each req.command through the bounded exec path and compares
-  // canonical response byte-exactly against res.
+/**
+ * Bounded replay harness.
+ *
+ * Activation status:
+ *   - grammar-rejected.trace.jsonl: FULLY ACTIVATED (all turns are parse-time
+ *     rejections; no execution, no network).
+ *   - call-filter-transform / foreach-save-merge / if-wait-history: still
+ *     `it.todo()` because their canonical responses depend on real HTTP fetch
+ *     timings and live api.github.com data. Byte-exact replay needs either
+ *     (a) a recorded-and-replayed HTTP layer (nock/undici-mock) with frozen
+ *     timing, or (b) relaxed matching that strips duration from status_line.
+ *     Deferred.
+ */
+describe("golden traces — bounded replay", () => {
   const files = listTraceFiles(BOUNDED_DIR);
   for (const file of files) {
     const rel = path.relative(GOLDEN_DIR, file).replace(/\\/g, "/");
-    it.todo(`replay ${rel} against bounded runtime`);
+    if (rel.endsWith("grammar-rejected.trace.jsonl")) {
+      describe(`replay ${rel}`, () => {
+        const loaded = loadTrace(file);
+        const caps = capsFromMeta(loaded.meta);
+        for (let i = 0; i < loaded.turns.length; i++) {
+          const turn = loaded.turns[i];
+          const src = String((turn.req as Record<string, unknown>).command ?? "");
+          const expected = turn.res as { error?: { code?: string } };
+          const expectedCode = expected.error?.code;
+          it(`turn ${turn.t ?? i + 1}: ${src.slice(0, 40).replace(/\n/g, "\\n")}`, async () => {
+            const { parseProgram } = await import("../../src/parser/parse.js");
+            const { executeProgram } = await import("../../src/runtime/execute.js");
+            const { createSession } = await import("../../src/runtime/session.js");
+            const { A2EError } = await import("../../src/errors.js");
+            // Parse OR execute — some rejections (raw bash, $()) are parse-time,
+            // others (SCOPE_MISS, CAPABILITY_DENIED) are runtime. The harness
+            // tries both paths so the trace can mix the two freely.
+            let seenCode: string | null = null;
+            try {
+              const program = parseProgram(src);
+              const session = createSession(`replay-${turn.t}`, caps);
+              const [resp] = await executeProgram(session, src, program);
+              if (resp && resp.error) seenCode = resp.error.code;
+            } catch (e) {
+              if (e instanceof A2EError) seenCode = e.code;
+              else throw e;
+            }
+            expect(seenCode,
+              `turn ${turn.t}: expected error but got OK`).not.toBeNull();
+            if (expectedCode) expect(seenCode).toBe(expectedCode);
+          });
+        }
+      });
+    } else {
+      it.todo(`replay ${rel} (needs HTTP mock layer + timing-relaxed diff)`);
+    }
   }
 });
+
+/**
+ * Translate the trace's `_meta.capabilities` shape into CallCapabilities.
+ * Safe defaults fill in anything the trace omits.
+ */
+function capsFromMeta(meta: TraceMeta): import("../../src/runtime/session.js").CallCapabilities {
+  const raw = meta.capabilities as Record<string, unknown>;
+  return {
+    binariesAllowlist: Array.isArray(raw.binaries_allowlist) ? (raw.binaries_allowlist as string[]) : [],
+    httpDomainsAllowlist: Array.isArray(raw.http_domains_allowlist) ? (raw.http_domains_allowlist as string[]) : [],
+    maxExecTimeoutMs: typeof raw.max_exec_timeout_ms === "number" ? raw.max_exec_timeout_ms : 5000,
+    maxResponseBytes: typeof raw.max_response_bytes === "number" ? raw.max_response_bytes : 65536,
+    binaryPaths: {},
+    pathEnv: "",
+  };
+}
