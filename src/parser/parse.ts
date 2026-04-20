@@ -18,7 +18,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { generate } from "peggy";
+// peggy is a CJS module. Default import works under both vitest (static
+// interop) and tsx / plain node --loader pipelines (dynamic interop). Named
+// imports `import { generate } from "peggy"` succeed in vitest but fail in
+// tsx with "does not provide an export named 'generate'".
+import peggy from "peggy";
 import type {
   Assignment,
   ForeachBlock,
@@ -40,7 +44,7 @@ const grammarSource = fs.readFileSync(
   "utf8",
 );
 
-const compiled = generate(grammarSource);
+const compiled = peggy.generate(grammarSource);
 
 interface PeggyError extends Error {
   message: string;

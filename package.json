@@ -19,7 +19,8 @@
     "test:golden": "vitest run tests/integration/golden.test.ts",
     "bench:tokens": "tsx tests/benchmarks/tokens.ts",
     "bench:http": "tsx tests/benchmarks/http.bench.ts",
-    "bench:mcp": "tsx tests/benchmarks/mcp-gateway.ts"
+    "bench:mcp": "tsx tests/benchmarks/mcp-gateway.ts",
+    "bench:bounded": "tsx tests/benchmarks/bounded-vs-a2e-json.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",

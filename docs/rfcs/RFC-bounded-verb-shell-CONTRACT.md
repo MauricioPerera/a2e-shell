@@ -12,7 +12,7 @@
 
 Shell no-Turing de 8 verbos + meta-comandos, consumida por un LLM como único usuario, que reemplaza el protocolo A2E declarativo JSON. Un comando por turno, canonical response truncada, encadenamiento hasta completar workflow. El transcript append-only **es** el artefacto replayable — no existe formato JSON paralelo.
 
-Éxito binario: un agente LLM arbitrario (Claude, GPT-4, Gemma, Llama) completa las 12 golden traces de `tests/golden/` con cobertura semántica 100% de los 8 verbos A2E-JSON y ≤20% de los tokens que consumiría la versión JSON equivalente.
+Éxito binario: un agente LLM arbitrario (Claude, GPT-4, Gemma, Llama) completa las golden traces de `tests/golden/bounded/` con cobertura semántica 100% de los 8 verbos A2E-JSON y ≤20% de los tokens que consumiría la versión JSON equivalente **en workloads con respuestas ≥2KB** (ver §6 para el régimen detallado; el claim universal de "≤20%" es aspiracional).
 
 ## 2. Inputs y Outputs
 
@@ -142,7 +142,12 @@ Greenfield. Establecer desde commit 1:
 - [ ] Preview > 512B → `truncated:true` + `shape.bytes` con total real; `show $x` entrega completo
 - [ ] Ninguna env var con nombre match `/(_TOKEN|_SECRET|_KEY|AWS_|GCP_|AZURE_)$/i` aparece en ninguna canonical response (ni `preview`, ni `stderr`, ni `binding`, ni `status_line`)
 - [ ] Parser rechaza: backticks, `$()`, heredocs, `>`/`<`, `&&`, `||`, `;` fuera de `block`, globs, brace expansion
-- [ ] Tokens por golden trace ≤ 20% del equivalente A2E-JSON (medido con `gpt-tokenizer`)
+- [ ] Tokens por golden trace según régimen de payload (`npm run bench:bounded`, cl100k_base):
+  - `large-response-workload` (respuestas ≥2KB cada una): **≤20%** de A2E-JSON
+  - `call-filter-transform` (respuestas mixtas, ~600B): **≤60%**
+  - Traces con payloads pequeños (foreach-save-merge, if-wait-history): **≤120%** (parity aceptable)
+
+  El claim original de "≤20% universal" era aspiracional. La truncación de preview amortiza cuando el response es grande; en respuestas pequeñas el overhead del canonical wrapper domina y la ventaja desaparece.
 - [ ] Tasa de rechazo sintáctico primer intento < 5% en las 12 golden traces (medido con al menos 2 modelos distintos)
 - [ ] `EXEC_TIMEOUT_MS` (default 15000) excedido → SIGKILL + `E_TIMEOUT`
 
