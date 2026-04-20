@@ -6,6 +6,27 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.3.1] - 2026-04-20
+
+**Hotfix.** Production deployments (Docker image built with `npm prune --omit=dev` in the runtime stage) crashed the first time any session issued a bounded-mode command — `peggy` was in `devDependencies` but imported at runtime by `src/parser/parse.ts`. This bug shipped in v1.2.0 but was never deployed to prod (the production VPS jumped v1.1 → v1.3 directly), so it only surfaced during the v1.3.0 smoke test.
+
+### Fixed
+
+- `package.json`: move `peggy` from `devDependencies` to `dependencies`. `package-lock.json` regenerated. Confirmed via `npm ci --omit=dev` that `peggy` is now installed in the runtime layer.
+- No code changes. Same 384 tests still passing on the dev machine (`peggy` was always available in dev where the suite installs all deps). The bug was purely a packaging miscategorization.
+
+### Impact
+
+- v1.2.0 Docker images are also affected. If you built and deployed v1.2.0 via `npm prune --omit=dev`, bounded mode would return `INTERNAL` (`Cannot find package 'peggy' imported from /app/dist/parser/parse.js`) on every exec. Rebuild with v1.3.1 or apply the package.json patch on top of v1.2.0.
+- v1.1.0 and earlier are unaffected — bounded mode didn't exist.
+- Unrestricted mode unaffected at any version.
+
+### Migration
+
+None. Same `v1.3.0` surface. Rebuild the Docker image from the `v1.3.1` tag.
+
+---
+
 ## [1.3.0] - 2026-04-20
 
 Final release of v1.3 — **MCP breadth**. All rc.1 surface is promoted to GA:
