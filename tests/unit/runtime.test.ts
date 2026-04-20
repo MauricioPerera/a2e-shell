@@ -149,6 +149,24 @@ describe("runtime — save + TTL + conflict", () => {
     expect(JSON.parse(showR.preview)).toBe(2);
   });
 
+  it("interpolated save name resolves $-vars from scope", async () => {
+    const s = createSession("sv-interp");
+    await run(s, 'save "nodejs" as org');
+    await run(s, '$x = save 42 as "stats_${$org}"');
+    const showR = okOf(await run(s, "show $stats_nodejs"));
+    expect(JSON.parse(showR.preview)).toBe(42);
+  });
+
+  it("interpolated save name inside foreach gives per-iteration bindings", async () => {
+    const s = createSession("sv-foreach");
+    await run(s, 'save [{"name":"a"},{"name":"b"}] as items');
+    await run(s, "foreach $it in $items do\n  save 1 as \"n_${$it.name}\"\nend");
+    const envR = okOf(await run(s, "env"));
+    const { bindings } = JSON.parse(envR.preview) as { bindings: string[] };
+    expect(bindings).toContain("n_a");
+    expect(bindings).toContain("n_b");
+  });
+
   it("assignment lhs + save as bind both names", async () => {
     const s = createSession("sv4");
     await run(s, "$a = save [1,2] as b");

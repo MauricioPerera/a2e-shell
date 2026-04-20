@@ -18,7 +18,7 @@
  * declares a shape the runtime can't produce, it fails here first, fast.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -273,15 +273,18 @@ describe("golden traces — bounded coverage aggregate", () => {
 /**
  * Bounded replay harness.
  *
- * Activation status:
- *   - grammar-rejected.trace.jsonl: FULLY ACTIVATED (all turns are parse-time
- *     rejections; no execution, no network).
- *   - call-filter-transform / foreach-save-merge / if-wait-history: still
- *     `it.todo()` because their canonical responses depend on real HTTP fetch
- *     timings and live api.github.com data. Byte-exact replay needs either
- *     (a) a recorded-and-replayed HTTP layer (nock/undici-mock) with frozen
- *     timing, or (b) relaxed matching that strips duration from status_line.
- *     Deferred.
+ * Two modes:
+ *   - grammar-rejected.trace.jsonl: byte-precise check of error.code per turn
+ *     (all are parse-time or runtime rejections; no network).
+ *   - call-filter-transform / foreach-save-merge / if-wait-history: SEMANTIC
+ *     replay. HTTP calls are stubbed via globalThis.fetch override returning
+ *     canned JSON whose SHAPE matches the trace (synthetic values). The diff
+ *     compares OK/ERR status, verb in status_line, shape.kind (with list↔table
+ *     relaxation since homogeneous-key lists upgrade to tables), rows if
+ *     declared, and binding presence. Durations / exact bytes / preview content
+ *     are intentionally not checked — the trace was written before the runtime
+ *     existed and its status_line strings (`json<Array<object>>[N]`) are
+ *     aspirational; the actual format is what describeShape() emits.
  */
 describe("golden traces — bounded replay", () => {
   const files = listTraceFiles(BOUNDED_DIR);
@@ -321,10 +324,213 @@ describe("golden traces — bounded replay", () => {
         }
       });
     } else {
-      it.todo(`replay ${rel} (needs HTTP mock layer + timing-relaxed diff)`);
+      registerSemanticReplay(file, rel);
     }
   }
 });
+
+// -- semantic replay (HTTP-dependent traces) ---------------------------------
+
+/**
+ * Shape-level replay. Byte-exact replay is untenable because the traces were
+ * written before the runtime existed and encode:
+ *   - aspirational status_line format `json<Array<object>>[N]` vs actual
+ *     `list[N]` / `table[NxM]` produced by describeShape()
+ *   - variable durations (`in 312ms`)
+ *   - exact byte counts that depend on formatting
+ *   - specific GitHub repo data that drifts over time
+ *
+ * What we check per turn:
+ *   - Status OK vs ERR matches expectation (derived from expected.status_line).
+ *   - The verb token in status_line ("call" | "filter" | ...) matches.
+ *   - shape.kind matches (list→list, record→record, ...), with a "list is a
+ *     valid substitute for table" relaxation (homogeneous keys produce table
+ *     but trace may say list).
+ *   - binding presence matches (null vs non-null).
+ *   - error.code exact match when the trace declares one.
+ *
+ * HTTP mocking: a per-test fetch stub matches URLs by glob-ish prefix and
+ * returns canned JSON whose shape is what the trace's `shape` field asserts.
+ * Unmocked URLs throw a loud error to catch drift.
+ */
+function registerSemanticReplay(file: string, rel: string): void {
+  describe(`replay ${rel}`, () => {
+    const loaded = loadTrace(file);
+    const caps = capsFromMeta(loaded.meta);
+    const mocks = mocksForTrace(rel);
+
+    const originalFetch = globalThis.fetch;
+    beforeAll(() => {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        for (const [prefix, body] of mocks) {
+          if (url.startsWith(prefix)) {
+            return new Response(JSON.stringify(body), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
+          }
+        }
+        throw new Error(`unmocked fetch: ${url}`);
+      }) as typeof fetch;
+    });
+    afterAll(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    // Each trace runs as one session — bindings carry across turns.
+    let sessionHolder: { s: import("../../src/runtime/session.js").Session } | null = null;
+    beforeAll(async () => {
+      const { createSession } = await import("../../src/runtime/session.js");
+      sessionHolder = { s: createSession(`replay-${loaded.meta.name}`, caps) };
+    });
+
+    for (let i = 0; i < loaded.turns.length; i++) {
+      const turn = loaded.turns[i];
+      const src = String((turn.req as Record<string, unknown>).command ?? "");
+      const expectedRes = turn.res as {
+        status_line: string;
+        shape: { kind: string; rows?: number } | null;
+        binding: string | null;
+        error: { code: string } | null;
+      };
+      it(`turn ${turn.t ?? i + 1}: ${src.slice(0, 40).replace(/\n/g, "\\n")}`, async () => {
+        const { parseProgram } = await import("../../src/parser/parse.js");
+        const { executeProgram } = await import("../../src/runtime/execute.js");
+        const { A2EError } = await import("../../src/errors.js");
+
+        let actual: import("../../src/runtime/canonical.js").CanonicalResponse | null = null;
+        let thrownCode: string | null = null;
+        try {
+          const program = parseProgram(src);
+          const [r] = await executeProgram(sessionHolder!.s, src, program);
+          actual = r ?? null;
+        } catch (e) {
+          if (e instanceof A2EError) thrownCode = e.code;
+          else throw e;
+        }
+
+        assertSemanticMatch({ turn: turn.t ?? i + 1, src, expected: expectedRes, actual, thrownCode });
+      });
+    }
+  });
+}
+
+interface ExpectedRes {
+  status_line: string;
+  shape: { kind: string; rows?: number } | null;
+  binding: string | null;
+  error: { code: string } | null;
+}
+
+function assertSemanticMatch(ctx: {
+  turn: number;
+  src: string;
+  expected: ExpectedRes;
+  actual: import("../../src/runtime/canonical.js").CanonicalResponse | null;
+  thrownCode: string | null;
+}): void {
+  const { expected, actual, thrownCode } = ctx;
+  const label = `turn ${ctx.turn}`;
+  // 1. OK vs ERR
+  const expectedIsOk = expected.error === null;
+  if (thrownCode !== null) {
+    // A2EError escaped executeProgram — only valid if trace expected an error.
+    expect(expectedIsOk, `${label}: runtime threw ${thrownCode} but trace expected OK`).toBe(false);
+    if (expected.error) expect(thrownCode).toBe(expected.error.code);
+    return;
+  }
+  expect(actual, `${label}: no response and no throw`).not.toBeNull();
+  if (!actual) return;
+  const actualIsOk = actual.error === null;
+  expect(actualIsOk, `${label}: expected ${expectedIsOk ? "OK" : "ERR"} but got ${actualIsOk ? "OK" : "ERR"}`)
+    .toBe(expectedIsOk);
+
+  if (!expectedIsOk) {
+    expect(actual.error?.code).toBe(expected.error?.code);
+    return;
+  }
+
+  // 2. Verb token in status_line
+  const expectedVerb = parseVerb(expected.status_line);
+  const actualVerb = parseVerb(actual.status_line);
+  expect(actualVerb, `${label}: verb mismatch`).toBe(expectedVerb);
+
+  // 3. shape.kind with list↔table relaxation
+  if (expected.shape && actual.shape && actual.shape.kind !== "void") {
+    const ek = expected.shape.kind;
+    const ak = actual.shape.kind;
+    const kindsMatch =
+      ek === ak ||
+      (ek === "list" && ak === "table") ||
+      (ek === "table" && ak === "list");
+    expect(kindsMatch, `${label}: shape.kind ${ek} vs ${ak}`).toBe(true);
+    // 4. rows if declared
+    if (typeof expected.shape.rows === "number" && "rows" in actual.shape) {
+      expect(actual.shape.rows).toBe(expected.shape.rows);
+    }
+  }
+
+  // 5. binding presence; strip leading $ for comparison (trace uses $name,
+  // runtime emits bare name — HTTP bridge adds $ on the way out).
+  const expectedBinding = expected.binding ? expected.binding.replace(/^\$/, "") : null;
+  expect(actual.binding).toBe(expectedBinding);
+}
+
+function parseVerb(statusLine: string): string | null {
+  const m = statusLine.match(/^OK \| (\w+)/) ?? statusLine.match(/^ERR \| (\w+)/);
+  return m ? m[1]! : null;
+}
+
+// -- per-trace fetch mocks ---------------------------------------------------
+
+/**
+ * Mocks are URL-prefix → JSON body. The bodies are SHAPE-realistic (same
+ * rows, same keys as the trace would see from real api.github.com) but values
+ * are synthetic. Semantic replay only asserts shape, never exact values.
+ */
+function mocksForTrace(rel: string): Array<[string, unknown]> {
+  if (rel.endsWith("call-filter-transform.trace.jsonl")) {
+    return [[
+      "https://api.github.com/orgs/nodejs/repos",
+      Array.from({ length: 10 }, (_, i) => ({
+        id: 27193779 + i,
+        name: `repo-${i}`,
+        full_name: `nodejs/repo-${i}`,
+        stargazers_count: 100 + i,
+        open_issues_count: i,
+        archived: i < 3, // 3 archived, 7 active
+      })),
+    ]];
+  }
+  if (rel.endsWith("foreach-save-merge.trace.jsonl")) {
+    return [
+      [
+        "https://api.github.com/orgs/nodejs/repos",
+        [
+          { id: 1, name: "http-parser", full_name: "nodejs/http-parser", owner: { login: "nodejs" } },
+          { id: 2, name: "node", full_name: "nodejs/node", owner: { login: "nodejs" } },
+          { id: 3, name: "llhttp", full_name: "nodejs/llhttp", owner: { login: "nodejs" } },
+        ],
+      ],
+      // All /repos/nodejs/<name>/stats/contributors — same prefix covers all.
+      [
+        "https://api.github.com/repos/nodejs/",
+        [{ total: 1, author: { login: "sam" }, weeks: [] }],
+      ],
+    ];
+  }
+  if (rel.endsWith("if-wait-history.trace.jsonl")) {
+    return [[
+      "https://api.github.com/rate_limit",
+      {
+        resources: { core: { limit: 60, used: 3, remaining: 57, reset: 1745020800 } },
+        rate: { limit: 60, used: 3, remaining: 57, reset: 1745020800 },
+      },
+    ]];
+  }
+  return [];
+}
 
 /**
  * Translate the trace's `_meta.capabilities` shape into CallCapabilities.

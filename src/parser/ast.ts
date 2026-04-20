@@ -90,7 +90,9 @@ export type MergeStrategy = "inner" | "left" | "right" | "outer";
 
 export type FilterCmd    = { kind: "filter";    target: Value; predicate: Predicate };
 export type TransformCmd = { kind: "transform"; target: Value; op: TransformOp };
-export type SaveCmd      = { kind: "save";      target: Value; as: string; ttl: DurationLit | null; overwrite: boolean };
+// `as: Value` (not string) so interpolated names work: `save $x as "stats_${$repo.name}"`.
+// The dispatcher evaluates cmd.as to a string at exec time.
+export type SaveCmd      = { kind: "save";      target: Value; as: Value;    ttl: DurationLit | null; overwrite: boolean };
 export type WaitCmd      = { kind: "wait";      duration: DurationLit };
 export type MergeCmd     = {
   kind: "merge";

@@ -278,8 +278,18 @@ async function executeVerb(
     case "save": {
       const cmd = verb as SaveCmd;
       const target = evalValue(cmd.target, { session });
-      const resolvedName = cmd.as; // grammar hands us the bare name (may include chars from interp in v0.2)
-      const { name, value } = runSave(session, cmd, target, resolvedName);
+      // cmd.as is now a Value (literal string, InterpStr, etc). Evaluate it
+      // and coerce to string. Interpolated names need $-vars bound in scope,
+      // which holds for both top-level assignments and foreach iterations
+      // (the iterVar is bound before body stmts run).
+      const resolvedAs = evalValue(cmd.as, { session });
+      if (typeof resolvedAs !== "string") {
+        throw new A2EError(
+          "PARSE_ERROR",
+          `save target name must resolve to string, got ${typeof resolvedAs}`,
+        );
+      }
+      const { name, value } = runSave(session, cmd, target, resolvedAs);
       // save's canonical binding reports the save target, not the assignment lhs.
       updateLast(session, makeBinding(value));
       const res = canonicalOk({ verb: "save", value, binding: name, durationMs: Date.now() - started });

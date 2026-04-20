@@ -125,10 +125,14 @@ SaveCmd
       return { kind: "save", target, as, ttl, overwrite };
     }
 
-// save name: quoted string OR bare identifier (may include interpolation in quoted form).
+// save name: a Value that must resolve to string at exec time. Supports:
+//   - interpolated string:  "stats_${$repo.name}"
+//   - plain string:          "my_name"
+//   - bare identifier:       fresh  (wrapped into StringLit for uniform AST)
 SaveName
-  = s:String { return s.value; }
-  / IdentChars
+  = InterpString
+  / String
+  / s:IdentChars { return { kind: "string", value: s }; }
 
 SaveFlag
   = "--ttl" SP d:Duration { return { kind: "ttl", duration: d }; }

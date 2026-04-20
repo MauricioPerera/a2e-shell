@@ -93,9 +93,17 @@ describe("parser — valid verb calls", () => {
     const verb = only<VerbCall>(p);
     expect(verb.kind).toBe("save");
     if (verb.kind === "save") {
-      expect(verb.as).toBe("stats_foo");
+      // `as` is now a Value (StringLit for bare-ident / quoted names,
+      // InterpStr for "${...}" names). Unwrap to compare.
+      expect(verb.as).toEqual({ kind: "string", value: "stats_foo" });
       expect(verb.ttl?.ms).toBe(300_000);
     }
+  });
+
+  it("save <value> as \"<interp>\" resolves at runtime", () => {
+    const p = parse("$x = save $stats as \"stats_${$repo.name}\"");
+    // Just check the AST shape — runtime resolution is tested in runtime.test.ts.
+    expect(p.stmts).toHaveLength(1);
   });
 
   it("wait <duration>", () => {
