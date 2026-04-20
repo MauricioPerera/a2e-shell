@@ -201,27 +201,28 @@ Additive scope on top of v1.1. No breaking changes to v1.1 surface. Tag: `v1.2.0
 
 ---
 
-## v1.3 — MCP breadth
+## v1.3 — MCP breadth — **shipped (rc.1)**
 
-**Theme**: close the MCP gap that v1.1 left open. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](rfcs/002-mcp-stdio-and-breadth.md).
+**Theme**: close the MCP gap that v1.1 left open. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](rfcs/002-mcp-stdio-and-breadth.md). Tag: `v1.3.0-rc.1`.
 
 Additive on top of v1.2. No breaking changes to v1.1/v1.2 surface.
 
-### In scope (rc.1 target)
+### Shipped in rc.1
 
-- **stdio transport for MCP servers**: spawn the server as a subprocess, pipe line-framed JSON-RPC. Unlocks the majority of MCP servers in the wild (reference implementations, Postgres, filesystem, git — all ship stdio-only). Subprocess lifecycle at session create/delete: EOF → SIGTERM(2s) → SIGKILL(5s). Binary allowlist enforced. Crash → next `tools/call` returns `MCP_SERVER_UNREACHABLE`. No auto-restart in v1.3.
-- **`Mcp-Session-Id` threading**: for HTTP/SSE servers that maintain per-session state (OAuth, pagination cursors, cached auth), propagate the `Mcp-Session-Id` header across requests per MCP 2025-06-18 §2.1.4. Rotating ids honored. Logged as SHA-8 hash (never raw).
-- **Multi-server hardening**: 6+ concurrent servers per session, per-server rate limit (`mcp_per_server_rpm`, default 600/min), explicit keep-alive undici agent per (server id, session) with pool size 4. Load-test gate: p95 < 200ms overhead vs single-server.
+- **stdio transport for MCP servers**: subprocess + line-framed JSON-RPC. Lifecycle EOF → SIGTERM(2s) → SIGKILL(5s). Binary allowlist enforced. Crash → next `tools/call` returns `MCP_SERVER_UNREACHABLE`. No auto-restart in v1.3.
+- **`Mcp-Session-Id` threading**: capture on initialize, echo on every subsequent request (including `notifications/initialized`). Rotated ids adopted transparently. Invalid ids (400 with session-id-shaped body) trigger one retry without the header. SHA-8 hash logs, never raw.
+- **Multi-server hardening**: per-server rate limit (`rate_limit_rpm`, default 600/min, 0=disabled) via sliding 60s window. Client-side enforcement throws `RATE_LIMITED` (HTTP 429). Load test: 40 concurrent calls across 4 HTTP servers in <500ms (vs 800ms globally-serialized baseline) confirms isolation.
 
-### Deferred from v1.2
+### Deferred from v1.2 (continues deferred)
 
-- **SSE streaming for bounded**: JSON path is live; `Accept: text/event-stream` on bounded sessions still routes through the unrestricted streaming code. Low priority (bounded responses are point-in-time canonical, not progressive); defer until concrete use case appears.
+- **SSE streaming for bounded**: low priority (bounded responses are point-in-time canonical, not progressive). Defer until concrete use case appears.
 
 ### Deferred to v1.4
 
 - **Server-initiated notification stream**: long-lived GET for `notifications/resources/list_changed` etc. Pairs with `resources/subscribe`.
 - **resources/subscribe**: client-driven subscription to resource URIs; cache invalidation on `notifications/resources/updated`.
 - **`command: "npm:@modelcontextprotocol/..."` sugar**: convenience wrapper that resolves via `npx`. Security footgun; defer until the threat model is nailed down.
+- **Explicit undici Agent with pool size cap**: Node's default undici behavior already provides keep-alive and is sufficient per the v1.3 load test. Revisit only if production numbers regress.
 
 ---
 

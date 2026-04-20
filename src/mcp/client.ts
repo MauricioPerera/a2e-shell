@@ -21,6 +21,7 @@ import * as crypto from "node:crypto";
 import { A2EError } from "../errors.js";
 import { logger } from "../logging/logger.js";
 import type { Redactor } from "../credentials/redactor.js";
+import { buildRateLimiter, type RateLimiter } from "./rate-limit.js";
 import type { McpServerSpecHttpT } from "./schema.js";
 import { parseSseStream } from "./sse.js";
 import type {
@@ -96,6 +97,9 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
   // new value from the response); servers MAY invalidate the id (we retry
   // once without the header — see rpc()).
   let cachedSessionId: string | null = null;
+  // Per-server rate limiter. Enforced pre-flight so rate-capped clients fail
+  // fast without burning server quota. 0 rpm = disabled.
+  const rateLimiter: RateLimiter = buildRateLimiter(spec.id, spec.rate_limit_rpm);
 
   interface RpcOptions {
     /** Extra fields to merge into request.params._meta — used for progressToken. */
@@ -115,6 +119,11 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     rpcOpts: RpcOptions | undefined,
     includeSessionId: boolean,
   ): Promise<{ result: T; rotatedSessionId: string | null }> {
+    // Rate limit BEFORE acquiring a request id so a rejected attempt doesn't
+    // burn id space. The session-id-retry path (rpc() catch) also calls
+    // rpcOnce so a retry counts as a separate call toward the budget — same
+    // behavior as an immediate second call would see.
+    rateLimiter.acquire();
     const id = nextRequestId++;
     const body: JsonRpcRequest = { jsonrpc: "2.0", id, method };
     if (params !== undefined || rpcOpts?.meta) {

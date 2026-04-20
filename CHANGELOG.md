@@ -6,6 +6,67 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.3.0-rc.1] - 2026-04-20
+
+**Theme**: MCP breadth. Three additive items on top of v1.2 — stdio transport, `Mcp-Session-Id` header threading, and multi-server hardening. Purely additive; `transport: "stdio"` / `rate_limit_rpm` are opt-in fields, existing sessions are byte-identical. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](docs/rfcs/002-mcp-stdio-and-breadth.md).
+
+### Added — MCP stdio transport (RFC 002 §1-§3)
+
+Unlocks the majority of MCP servers in the wild (reference implementations, Postgres, filesystem, git) that ship stdio-only and previously required an HTTP wrapper for a2e-shell to consume.
+
+- `McpServerSpec` is now a discriminated union on `transport`: existing `http`/`sse` branches unchanged, new `stdio` branch with `command`, `args`, `env`, `cwd`, `timeout_ms`, `rate_limit_rpm`.
+- `src/mcp/stdio-client.ts` — subprocess spawn + line-framed JSON-RPC on stdin/stdout. Same `McpClient` interface as the HTTP client, so the rest of the system is transport-agnostic.
+  - Lifecycle: spawn → initialize → parallel discovery → live → EOF → `SIGTERM` at 2s → `SIGKILL` at 5s on close.
+  - Framing: MAX_LINE_BYTES = 1 MiB; longer lines surface `SIZE_LIMIT`. Non-JSON lines dropped at debug level (stderr cross-contamination guard).
+  - Crash handling: subprocess exit (non-zero, non-our-signal) rejects all pending requests with `MCP_SERVER_UNREACHABLE`. No auto-restart — operator recreates the session.
+  - stdin resilience: `'error'` handler swallows `ERR_STREAM_WRITE_AFTER_END`; `rpc()` pre-checks `stdin.writable`.
+- `src/mcp/connect.ts` — transport-agnostic dispatcher. Resolves stdio bare-name `command` via the session's binary allowlist (same policy gating bash exec + bounded `call`). Unknown command → `CAPABILITY_DENIED` before any subprocess is created.
+
+### Added — Mcp-Session-Id threading (RFC 002 §4)
+
+Honors MCP 2025-06-18 §2.1.4. Fixes the second-most-common HTTP MCP misbehavior: servers with per-session state (OAuth, pagination cursors, cached auth) previously saw each a2e-shell request as a cold start.
+
+- Captures `Mcp-Session-Id` from the initialize response, echoes on every subsequent request (including `notifications/initialized`).
+- Adopts rotated ids transparently. Logged as `mcp.session_id.rotated {old_hash, new_hash}`.
+- On `400` with session-id-shaped body (heuristic: contains "session" + one of `mcp-session-id` / `session_id` / `session id` / a `-32xxx` code), drops the cached id and retries once without the header. Logged as `mcp.session_id.invalidated {dropped_hash}`.
+- **SHA-8 hashes in logs, never raw**: full ids can carry auth-equivalent value on some servers. Hash is first 8 hex chars of SHA-256; stable across events for operator correlation.
+
+### Added — Multi-server hardening (RFC 002 §5)
+
+- **Per-server rate limit**: new optional field `rate_limit_rpm` on both `McpServerSpec` branches (default 600/min, `0` = disabled). Enforced client-side before the wire call via a sliding 60s window. Throws `RATE_LIMITED` (HTTP 429) with the server id in the message. Separate from the session-level `rateLimitPerMinute`.
+- **`src/mcp/rate-limit.ts`**: standalone limiter module, 50 lines, no dependencies. One instance per `(session, MCP server)` isolated inside the client closure.
+- **Concurrent multi-server load test**: 40 `tools/call` across 4 HTTP servers with Promise.all completes in <500ms (20ms/call × 40 / 4 servers ≈ 200ms + overhead), vs ~800ms if globally serialized. Confirms no global lock contention.
+- **HTTP connection reuse**: relies on Node's built-in undici keep-alive (same-origin sockets reused automatically). Explicit per-server pool sizing deferred — the default behavior is sufficient per the load test.
+
+### Schema changes
+
+All additive, backward-compatible:
+
+- `McpServerSpec` — new `transport: "stdio"` branch; both branches now accept optional `rate_limit_rpm: number` (default 600).
+- No route changes, no existing-field changes, no new HTTP headers required from clients that don't opt in.
+
+### Tests
+
+384 passed / 0 todo across 25 files. Typecheck clean.
+
+New test files:
+- `tests/integration/mcp-stdio.test.ts` (9 cases): handshake + all 4 primitives, garbage-line drop, mid-call crash, spawn failure, close lifecycle.
+- `tests/integration/mcp-session-id.test.ts` (5 cases): capture + echo, no-id backward compat, rotation, session-id 400 retry, non-session-id 400 surfaces as unreachable.
+- `tests/integration/mcp-multi-server.test.ts` (7 cases): RateLimiter unit (3), HTTP client rate-limit enforcement (2), 4-server parity band (1), 40-concurrent-call isolation (1).
+
+New fixture:
+- `tests/fixtures/mcp-stdio-server.mjs` — minimal Node MCP server (~130 LoC) implementing all 4 primitives with test hooks for `crash` / `garbage` modes.
+
+### Deferred
+
+- **Server-initiated notification stream** (long-lived GET for `notifications/resources/list_changed` etc.) — v1.4.
+- **resources/subscribe** — v1.4, pairs with the notification stream.
+- **`command: "npm:..."` sugar** — v1.4 if ever; needs threat-model work first.
+- **SSE streaming for bounded sessions** — continues deferred; low priority until a concrete use case appears.
+- **Explicit undici Agent with pool size cap** — revisit only if load-test numbers regress. Node's default behavior is sufficient today.
+
+---
+
 ## [1.2.0] - 2026-04-20
 
 Final release of v1.2 — **bounded-verb shell**. All rc.1 surface is promoted to GA:

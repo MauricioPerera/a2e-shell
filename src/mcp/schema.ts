@@ -51,6 +51,16 @@ const McpServerSpecHttp = z
      * tools/call and to the initial handshake.
      */
     timeout_ms: z.number().int().positive().max(300_000).default(30_000),
+    /**
+     * Per-server rate limit in requests per minute. Enforced client-side
+     * before the wire call; separate from session-level rateLimitPerMinute.
+     * Sliding 60s window. 0 disables.
+     *
+     * Default 600/min. Typical MCP servers can easily handle this; the cap
+     * exists to protect operators from a runaway client burning through their
+     * MCP server's own rate budget.
+     */
+    rate_limit_rpm: z.number().int().min(0).max(60_000).default(600),
   })
   .strict();
 
@@ -80,6 +90,12 @@ const McpServerSpecStdio = z
     cwd: z.string().optional(),
     /** Per-call timeout in ms. Default 30s. */
     timeout_ms: z.number().int().positive().max(300_000).default(30_000),
+    /**
+     * Per-server rate limit in requests per minute. Same semantics as the
+     * http/sse branch's field. Stdio subprocesses aren't immune — runaway
+     * clients can still OOM a subprocess with enough concurrent calls.
+     */
+    rate_limit_rpm: z.number().int().min(0).max(60_000).default(600),
   })
   .strict();
 

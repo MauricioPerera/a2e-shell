@@ -28,6 +28,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { A2EError } from "../errors.js";
 import { logger } from "../logging/logger.js";
 import type { Redactor } from "../credentials/redactor.js";
+import { buildRateLimiter, type RateLimiter } from "./rate-limit.js";
 import type { McpServerSpecStdioT } from "./schema.js";
 import type {
   JsonRpcRequest,
@@ -83,6 +84,7 @@ export async function connectStdioMcpServer(
   // --- per-connection mutable state ----------------------------------------
 
   let nextRequestId = 1;
+  const rateLimiter: RateLimiter = buildRateLimiter(spec.id, spec.rate_limit_rpm);
   const pending = new Map<
     number,
     {
@@ -279,6 +281,7 @@ export async function connectStdioMcpServer(
       );
     }
 
+    rateLimiter.acquire();
     const id = nextRequestId++;
     const body: JsonRpcRequest = { jsonrpc: "2.0", id, method };
     if (params !== undefined || rpcOpts?.meta) {
