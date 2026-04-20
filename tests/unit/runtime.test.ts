@@ -363,6 +363,63 @@ describe("runtime — foreach block", () => {
     expect(r.error.code).toBe("SCOPE_MISS");
   });
 
+  it("--parallel=N runs iterations concurrently with isolated $item frames", async () => {
+    const s = createSession("fe-par");
+    await run(s, "save [1,2,3,4,5,6,7,8,9,10] as nums");
+    // 10 iterations, concurrency 4. Each body sleeps then reads $n. Without
+    // per-iteration frames they'd all see the same (last-set) $n because
+    // concurrent awaits would trample a session-scoped binding.
+    const t0 = Date.now();
+    await run(
+      s,
+      "foreach $n in $nums --parallel=4 do\n  wait 40ms\n  save $n as \"captured_${$n}\"\nend",
+    );
+    const elapsed = Date.now() - t0;
+    // Sequential would take ≥400ms; parallel=4 should finish in ~120-200ms.
+    // Allow a wide band to avoid CI flakes; the key signal is <350ms.
+    expect(elapsed, `parallel foreach took ${elapsed}ms, expected <350ms`)
+      .toBeLessThan(350);
+
+    const envR = okOf(await run(s, "env"));
+    const { bindings } = JSON.parse(envR.preview) as { bindings: string[] };
+    // All 10 per-iteration bindings landed, proving $n resolved to distinct
+    // values across concurrent iterations.
+    for (let i = 1; i <= 10; i++) {
+      expect(bindings).toContain(`captured_${i}`);
+    }
+  });
+
+  it("--parallel=N iteration records are ordered by index, not completion", async () => {
+    const s = createSession("fe-par-order");
+    await run(s, "save [0,1,2,3] as ns");
+    const r = okOf(await run(
+      s,
+      "foreach $n in $ns --parallel=4 do\n  wait 10ms\nend",
+    ));
+    const rows = JSON.parse(r.preview) as Array<{ iteration: number }>;
+    expect(rows.map((x) => x.iteration)).toEqual([0, 1, 2, 3]);
+  });
+
+  it("nested foreach: inner var shadows outer, outer still visible", async () => {
+    const s = createSession("fe-nested");
+    await run(s, "save [10,20] as outers");
+    await run(s, "save [1,2] as inners");
+    await run(s, [
+      "foreach $x in $outers do",
+      "  foreach $y in $inners do",
+      "    save $x as \"o_${$x}\" --overwrite",
+      "    save $y as \"i_${$y}\" --overwrite",
+      "  end",
+      "end",
+    ].join("\n"));
+    const envR = okOf(await run(s, "env"));
+    const { bindings } = JSON.parse(envR.preview) as { bindings: string[] };
+    expect(bindings).toContain("o_10");
+    expect(bindings).toContain("o_20");
+    expect(bindings).toContain("i_1");
+    expect(bindings).toContain("i_2");
+  });
+
   it("--on-error=continue records error_code per iteration and keeps going", async () => {
     const s = createSession("fe7");
     await run(s, "save [1,2] as xs");

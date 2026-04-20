@@ -34,9 +34,8 @@ import {
   canonicalVoid,
   type CanonicalResponse,
 } from "./canonical.js";
-import { evalPredicate, evalValue } from "./evaluate.js";
+import { evalPredicate, evalValue, withPushedFrame } from "./evaluate.js";
 import {
-  bind,
   makeBinding,
   recordTurn,
   updateLast,
@@ -136,15 +135,22 @@ async function executeIfBlock(
 /**
  * `foreach $item in <list> [--parallel=N] [--on-error=abort|continue] do ... end`.
  *
- * v0.1 semantics:
- *   - `--parallel=N` is ACCEPTED but executes sequentially. The flag is
- *     validated + stored on the AST; concurrent execution is deferred until
- *     evalValue supports per-iteration scopes (would need to shadow the item
- *     binding per task).
+ * v1.2-rc.1 semantics:
+ *   - The iteration variable is a LEXICAL frame, not a session binding. Each
+ *     iteration pushes `{itemVar → item}` via `withPushedFrame`; the evaluator
+ *     walks the frame stack before falling back to session scope. Frames are
+ *     carried through await boundaries by AsyncLocalStorage, so N concurrent
+ *     iterations keep isolated `$item` bindings without racing on session state.
+ *   - `--parallel=N` now executes up to N iterations concurrently (Semaphore-
+ *     limited). Iteration-internal work still touches `session.bindings` —
+ *     verbs that write shared names (e.g. `save $x as fixed`) will race in
+ *     parallel mode; use interpolated save names (`"item_${$idx}"`) for
+ *     per-iteration accumulators.
  *   - `--on-error=continue` catches errors inside the body and records them
  *     on the iteration record; `abort` (default) propagates the first error.
  *
- * Return value: list of `{iteration, last_verb, last_binding, error?}` records.
+ * Return value: list of `{iteration, last_verb, last_binding, error_code?}`
+ * records, ordered by iteration index regardless of completion order.
  */
 async function executeForeachBlock(
   session: Session,
@@ -156,17 +162,15 @@ async function executeForeachBlock(
     throw new A2EError("PARSE_ERROR", `foreach: target must be list, got ${typeof list}`);
   }
 
-  // Stash any existing binding for the iteration variable; restore at end.
-  const stashed = session.bindings.get(block.itemVar);
-  const results: Record<string, RuntimeValue>[] = [];
+  const concurrency = Math.max(1, Math.min(block.parallel ?? 1, list.length || 1));
+  const results: Record<string, RuntimeValue>[] = new Array(list.length);
 
-  try {
-    for (let i = 0; i < list.length; i++) {
-      const item = list[i] as RuntimeValue;
-      bind(session, block.itemVar, makeBinding(item));
-      let lastVerb = "?";
-      let lastBinding: string | null = null;
-      let errorCode: string | null = null;
+  const runOne = async (i: number, item: RuntimeValue): Promise<void> => {
+    let lastVerb = "?";
+    let lastBinding: string | null = null;
+    let errorCode: string | null = null;
+    const frame = new Map<string, RuntimeValue>([[block.itemVar, item]]);
+    await withPushedFrame(frame, async () => {
       for (const stmt of block.body) {
         try {
           const r = await executeStmt(session, stmt, Date.now());
@@ -185,17 +189,22 @@ async function executeForeachBlock(
           break;
         }
       }
-      const record: Record<string, RuntimeValue> = {
-        iteration: i,
-        last_verb: lastVerb,
-        last_binding: lastBinding,
-      };
-      if (errorCode !== null) record.error_code = errorCode;
-      results.push(record);
+    });
+    const record: Record<string, RuntimeValue> = {
+      iteration: i,
+      last_verb: lastVerb,
+      last_binding: lastBinding,
+    };
+    if (errorCode !== null) record.error_code = errorCode;
+    results[i] = record;
+  };
+
+  if (concurrency === 1) {
+    for (let i = 0; i < list.length; i++) {
+      await runOne(i, list[i] as RuntimeValue);
     }
-  } finally {
-    if (stashed !== undefined) session.bindings.set(block.itemVar, stashed);
-    else session.bindings.delete(block.itemVar);
+  } else {
+    await runBounded(list.length, concurrency, (i) => runOne(i, list[i] as RuntimeValue));
   }
 
   updateLast(session, makeBinding(results));
@@ -211,6 +220,38 @@ function verbNameOf(stmt: Stmt): string {
   if (stmt.kind === "assignment") return verbNameOf(stmt.rhs as Stmt);
   if (stmt.kind === "call-http" || stmt.kind === "call-cli") return "call";
   return stmt.kind;
+}
+
+/**
+ * Bounded-concurrency fan-out. Spawns `concurrency` worker loops that pull
+ * indices from a shared counter. Rejects fast: if any worker throws, the
+ * remaining workers drain (they check `aborted` at the top of each pull)
+ * and the outer promise rejects with the first error. This preserves
+ * `--on-error=abort` semantics: first failure wins.
+ */
+async function runBounded(
+  total: number,
+  concurrency: number,
+  task: (i: number) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let firstError: unknown = null;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      if (firstError !== null) return;
+      const i = next++;
+      if (i >= total) return;
+      try {
+        await task(i);
+      } catch (e) {
+        if (firstError === null) firstError = e;
+        return;
+      }
+    }
+  };
+  const n = Math.max(1, Math.min(concurrency, total));
+  await Promise.all(Array.from({ length: n }, worker));
+  if (firstError !== null) throw firstError;
 }
 
 async function executeAssignment(

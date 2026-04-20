@@ -68,14 +68,22 @@ Margins are generous on top of empirical to absorb tokenizer/shape-inference dri
 - `src/exec/pipeline-bounded.ts`: hydrate-or-fresh on first access (WeakMap coalesces concurrent hydrations), schedule-persist after every turn (WeakMap coalesces concurrent writes).
 - **Corrupt file fallback**: unreadable/invalid `bounded-state.json` logs a warning (`bounded.persist.read_failed`) and starts fresh. The corrupt file is NOT overwritten until the next successful turn — operators can inspect it.
 
+### Real `--parallel=N` in `foreach`
+
+Previously the flag parsed but iterations ran sequentially. rc.1 ships real concurrency:
+
+- The iteration variable is now a **lexical frame** carried by `AsyncLocalStorage`, not a session binding. Each iteration pushes `{itemVar → item}` via `withPushedFrame`; the evaluator walks the frame stack before falling back to session scope. `Promise.all` branches keep isolated `$item` bindings without racing on shared state.
+- `runBounded(total, concurrency, task)`: worker-pool loop pulls indices from a shared counter until drained. First error wins under `--on-error=abort`; remaining workers drain-and-exit.
+- Iteration records are ordered by index in the output (not by completion time), so downstream consumers keep deterministic row ordering regardless of scheduling.
+- Verbs that write shared session names (e.g. `save $x as fixed`) still race in parallel mode — use interpolated save names (`"item_${$n}"`) for per-iteration accumulators. Documented in the runtime's module banner.
+
 ### Not in this release (deferred)
 
 - **SSE streaming for bounded**: the JSON path is live; `Accept: text/event-stream` on a bounded session still routes through the unrestricted streaming code and will produce no useful output.
-- **Real `--parallel=N` in `foreach`**: flag is accepted and parsed but iterations run sequentially. Real concurrency needs per-iteration scope stack for the iterVar.
 
 ### Tests
 
-357 passed across 22 files. Typecheck clean.
+360 passed across 22 files. Typecheck clean.
 
 ### Migration
 

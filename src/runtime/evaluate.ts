@@ -5,8 +5,15 @@
  * current session's bindings for variable resolution. Interpolated strings
  * are assembled here. Field-paths with empty root ("") are resolved against
  * an explicit `ctx.item` (used inside predicates and `merge by`).
+ *
+ * Iteration scoping (v1.2-rc.1): `withPushedFrame()` installs a per-iteration
+ * lexical frame via AsyncLocalStorage. Var / path-root lookups walk the frame
+ * stack (innermost first) before falling back to `session.bindings`. This lets
+ * `foreach --parallel=N` run N iterations concurrently, each with its own
+ * `$item` binding, without racing on the shared session scope.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   InterpStr,
   ListLit,
@@ -21,6 +28,42 @@ import type {
 } from "../parser/ast.js";
 import { A2EError } from "../errors.js";
 import { lookup, type RuntimeValue, type Session } from "./session.js";
+
+// --- iteration scope stack --------------------------------------------------
+
+const iterationFrames = new AsyncLocalStorage<ReadonlyArray<ReadonlyMap<string, RuntimeValue>>>();
+
+/**
+ * Run `fn` with `frame` pushed on top of the iteration scope stack for the
+ * current async context. AsyncLocalStorage carries the store through every
+ * awaited boundary inside `fn`, so concurrent `Promise.all` branches that
+ * each call `withPushedFrame` get isolated stacks.
+ */
+export function withPushedFrame<T>(
+  frame: Map<string, RuntimeValue>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const existing = iterationFrames.getStore() ?? [];
+  const next = [...existing, frame];
+  return iterationFrames.run(next, fn);
+}
+
+/**
+ * Resolve a variable name honoring (1) iteration frames top-down, then
+ * (2) session bindings. Returns `undefined` when not found anywhere so
+ * callers can throw with a domain-specific error message.
+ */
+function lookupScoped(session: Session, name: string): RuntimeValue | undefined {
+  const frames = iterationFrames.getStore();
+  if (frames) {
+    for (let i = frames.length - 1; i >= 0; i--) {
+      const f = frames[i]!;
+      if (f.has(name)) return f.get(name);
+    }
+  }
+  const b = lookup(session, name);
+  return b ? b.value : undefined;
+}
 
 export interface EvalCtx {
   session: Session;
@@ -44,9 +87,9 @@ export function evalValue(v: Value, ctx: EvalCtx): RuntimeValue {
       return obj;
     }
     case "var": {
-      const b = lookup(ctx.session, v.name);
-      if (!b) throw unboundVar(v.name);
-      return b.value;
+      const val = lookupScoped(ctx.session, v.name);
+      if (val === undefined) throw unboundVar(v.name);
+      return val;
     }
     case "path":       return resolvePath(v as PathRef, ctx);
     case "interpString": return resolveInterp(v as InterpStr, ctx);
@@ -67,9 +110,9 @@ export function resolvePath(path: PathRef, ctx: EvalCtx): RuntimeValue {
     if (ctx.item === undefined) throw noImplicitItem();
     current = ctx.item;
   } else {
-    const b = lookup(ctx.session, path.root);
-    if (!b) throw unboundVar(path.root);
-    current = b.value;
+    const val = lookupScoped(ctx.session, path.root);
+    if (val === undefined) throw unboundVar(path.root);
+    current = val;
   }
   for (const step of path.steps) {
     current = stepInto(current, step, path);
