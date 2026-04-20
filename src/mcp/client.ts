@@ -17,6 +17,7 @@
  *   - persistent sessions (each call is a fresh request)
  */
 
+import * as crypto from "node:crypto";
 import { A2EError } from "../errors.js";
 import { logger } from "../logging/logger.js";
 import type { Redactor } from "../credentials/redactor.js";
@@ -89,6 +90,12 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
   const authHeaders = resolveAuthHeaders(spec, processEnv);
 
   let nextRequestId = 1;
+  // MCP 2025-06-18 §2.1.4: servers that maintain state emit `Mcp-Session-Id`
+  // on their initialize response. Clients MUST echo it back on every
+  // subsequent request. Servers MAY rotate the id mid-session (we adopt the
+  // new value from the response); servers MAY invalidate the id (we retry
+  // once without the header — see rpc()).
+  let cachedSessionId: string | null = null;
 
   interface RpcOptions {
     /** Extra fields to merge into request.params._meta — used for progressToken. */
@@ -97,12 +104,22 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     onNotification?: McpNotificationListener;
   }
 
-  async function rpc<T>(method: string, params?: unknown, opts?: RpcOptions): Promise<T> {
+  /**
+   * Single HTTP round-trip. Public rpc() wraps this with the 400+session-id
+   * retry-once logic so retries stay observable as a single RPC from the
+   * caller's perspective.
+   */
+  async function rpcOnce<T>(
+    method: string,
+    params: unknown,
+    rpcOpts: RpcOptions | undefined,
+    includeSessionId: boolean,
+  ): Promise<{ result: T; rotatedSessionId: string | null }> {
     const id = nextRequestId++;
     const body: JsonRpcRequest = { jsonrpc: "2.0", id, method };
-    if (params !== undefined || opts?.meta) {
+    if (params !== undefined || rpcOpts?.meta) {
       const p: Record<string, unknown> = (params as Record<string, unknown>) ?? {};
-      if (opts?.meta) p["_meta"] = { ...((p["_meta"] as Record<string, unknown>) ?? {}), ...opts.meta };
+      if (rpcOpts?.meta) p["_meta"] = { ...((p["_meta"] as Record<string, unknown>) ?? {}), ...rpcOpts.meta };
       (body as { params: unknown }).params = p;
     }
 
@@ -110,16 +127,21 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     const timer = setTimeout(() => controller.abort(), spec.timeout_ms);
     const started = Date.now();
 
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      // Announce that we accept both response formats (MCP Streamable HTTP).
+      accept: "application/json, text/event-stream",
+      ...authHeaders,
+    };
+    if (includeSessionId && cachedSessionId !== null) {
+      headers["Mcp-Session-Id"] = cachedSessionId;
+    }
+
     let res: Response;
     try {
       res = await fetch(spec.url, {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          // Announce that we accept both response formats (MCP Streamable HTTP).
-          accept: "application/json, text/event-stream",
-          ...authHeaders,
-        },
+        headers,
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -139,12 +161,34 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       );
     }
 
+    // Capture any Mcp-Session-Id the server returned (even on error responses
+    // — a 400 rejecting the cached id can still carry a new one). Returned via
+    // `rotatedSessionId` so the caller decides whether to adopt.
+    const rotated = res.headers.get("Mcp-Session-Id");
+    const rotatedSessionId = rotated && rotated.length > 0 ? rotated : null;
+
     if (res.status === 401 || res.status === 403) {
       clearTimeout(timer);
       throw new A2EError(
         "MCP_AUTH_FAILED",
         `mcp '${spec.id}' auth rejected (http ${res.status})`,
         401,
+      );
+    }
+    if (res.status === 400) {
+      // Inspect the body to see if it looks like a session-id-invalidation
+      // error. If so, surface a structured sentinel the outer rpc() can
+      // catch and retry once without the header.
+      clearTimeout(timer);
+      let bodyText = "";
+      try { bodyText = await res.text(); } catch { /* ignore */ }
+      if (looksLikeSessionIdError(bodyText)) {
+        throw new SessionIdRejectedError(rotatedSessionId);
+      }
+      throw new A2EError(
+        "MCP_SERVER_UNREACHABLE",
+        `mcp '${spec.id}' http 400: ${redactMessage(bodyText.slice(0, 200), redactor)}`,
+        503,
       );
     }
     if (!res.ok) {
@@ -168,7 +212,7 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
             `mcp '${spec.id}' ${method}: empty SSE stream`,
           );
         }
-        parsed = await consumeSseForResponse(res.body, id, opts?.onNotification);
+        parsed = await consumeSseForResponse(res.body, id, rpcOpts?.onNotification);
       } else {
         const text = await res.text();
         try {
@@ -198,6 +242,9 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       duration_ms: Date.now() - started,
       has_error: "error" in response,
       transport: contentType.includes("text/event-stream") ? "sse" : "json",
+      ...(cachedSessionId !== null || rotatedSessionId !== null
+        ? { mcp_session_id: sessionIdHash(rotatedSessionId ?? cachedSessionId) }
+        : {}),
     });
 
     if ("error" in response) {
@@ -206,7 +253,51 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
         `mcp '${spec.id}' ${method} error ${response.error.code}: ${redactMessage(response.error.message, redactor)}`,
       );
     }
-    return response.result;
+    return { result: response.result, rotatedSessionId };
+  }
+
+  /**
+   * Public RPC wrapper that handles:
+   *   1. Adopting a rotated `Mcp-Session-Id` on success (§2.1.4).
+   *   2. Retrying once without the cached id when a 400 looks like an
+   *      id-invalidation error (server dropped our session).
+   *
+   * Notifications (method starting with "notifications/") do NOT go through
+   * rpc — they never expect a response, so we keep sendNotification separate.
+   */
+  async function rpc<T>(
+    method: string,
+    params?: unknown,
+    rpcOpts?: RpcOptions,
+  ): Promise<T> {
+    try {
+      const { result, rotatedSessionId } = await rpcOnce<T>(method, params, rpcOpts, /*includeSessionId*/ true);
+      if (rotatedSessionId !== null && rotatedSessionId !== cachedSessionId) {
+        logger.info({
+          event: "mcp.session_id.rotated",
+          server_id: spec.id,
+          old_hash: sessionIdHash(cachedSessionId),
+          new_hash: sessionIdHash(rotatedSessionId),
+        });
+        cachedSessionId = rotatedSessionId;
+      }
+      return result;
+    } catch (e) {
+      if (e instanceof SessionIdRejectedError) {
+        // Server rejected our cached id. Drop it, retry once WITHOUT the
+        // header. The second try still throws if the failure was real.
+        logger.info({
+          event: "mcp.session_id.invalidated",
+          server_id: spec.id,
+          dropped_hash: sessionIdHash(cachedSessionId),
+        });
+        cachedSessionId = null;
+        const { result, rotatedSessionId } = await rpcOnce<T>(method, params, rpcOpts, /*includeSessionId*/ false);
+        if (rotatedSessionId !== null) cachedSessionId = rotatedSessionId;
+        return result;
+      }
+      throw e;
+    }
   }
 
   /**
@@ -253,13 +344,17 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
   });
 
   // Send the initialized notification (fire-and-forget, no response expected).
+  // Carries the session id if the server emitted one on initialize — stateful
+  // servers expect the notification to be tagged with the same id.
   try {
+    const notificationHeaders: Record<string, string> = {
+      "content-type": "application/json",
+      ...authHeaders,
+    };
+    if (cachedSessionId !== null) notificationHeaders["Mcp-Session-Id"] = cachedSessionId;
     await fetch(spec.url, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...authHeaders,
-      },
+      headers: notificationHeaders,
       body: JSON.stringify({
         jsonrpc: "2.0",
         method: "notifications/initialized",
@@ -430,4 +525,54 @@ function isJsonRpcResponse(x: unknown): boolean {
   if (typeof x !== "object" || x === null) return false;
   const o = x as { jsonrpc?: unknown };
   return o.jsonrpc === "2.0";
+}
+
+// --- Mcp-Session-Id helpers -------------------------------------------------
+
+/**
+ * Internal sentinel thrown by rpcOnce() when a 400 response looks like a
+ * session-id-invalidation error. rpc() catches this to drive the single
+ * retry without the header.
+ *
+ * Private to this module — never leaks to callers. The retry loop either
+ * succeeds (and returns the result) or re-throws as a regular A2EError.
+ */
+class SessionIdRejectedError extends Error {
+  readonly rotatedSessionId: string | null;
+  constructor(rotatedSessionId: string | null) {
+    super("Mcp-Session-Id rejected");
+    this.name = "SessionIdRejectedError";
+    this.rotatedSessionId = rotatedSessionId;
+  }
+}
+
+/**
+ * Heuristic for "this 400 was about the session id, not our request shape".
+ * MCP 2025-06-18 doesn't mandate a specific error body, so we look for
+ * surface markers most servers emit: the string "session" (case-insensitive)
+ * AND either a "-32xxx" JSON-RPC code or a "session_id" / "mcp-session-id"
+ * token. False positives cost one extra round-trip; false negatives leave
+ * the caller to recreate the session.
+ */
+function looksLikeSessionIdError(body: string): boolean {
+  if (!body) return false;
+  const lower = body.toLowerCase();
+  if (!lower.includes("session")) return false;
+  return (
+    lower.includes("mcp-session-id") ||
+    lower.includes("session_id") ||
+    lower.includes("session id") ||
+    /code["\s:]+-32\d{3}/i.test(body)
+  );
+}
+
+/**
+ * First 8 hex chars of SHA-256 over the session id. Used for structured
+ * logging — full ids carry auth-equivalent value on some servers, so we
+ * never write them to logs. Stable across calls for the same id so
+ * operators can correlate events.
+ */
+function sessionIdHash(id: string | null): string | null {
+  if (id === null) return null;
+  return crypto.createHash("sha256").update(id).digest("hex").slice(0, 8);
 }
