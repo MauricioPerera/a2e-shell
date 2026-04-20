@@ -6,6 +6,52 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.2.0] - 2026-04-20
+
+Final release of v1.2 — **bounded-verb shell**. All rc.1 surface is promoted to GA:
+
+- Closed-grammar DSL (8 verbs + 6 meta) as an optional per-session execution mode alongside the default unrestricted bash pipeline. Opt-in via `mode: "bounded"` at session create.
+- HTTP wiring is byte-identical to v1.1 for any session that doesn't pass `mode`. The only addition is the already-reserved bounded path through the existing `/sessions` and `/exec` endpoints.
+- Persistence, real `foreach --parallel=N`, and cross-tokenizer validation all shipped inside rc.1 and freeze as stable v1.x surface at this tag.
+
+### Deliverables frozen at this tag
+
+- `src/parser/` — peggy-compiled grammar + typed AST + R2/R5/R7 enforcement.
+- `src/runtime/` — session state, canonical response builder, evaluator (with AsyncLocalStorage iteration frames), dispatcher, persist module.
+- `src/verbs/` — call (HTTP + CLI), filter, transform, save, wait, merge. if/foreach blocks dispatched from `runtime/execute.ts`.
+- `src/meta/` — describe, head, show, env, history, help.
+- `src/exec/pipeline-bounded.ts` — bridge between HTTP Session surface and the bounded runtime. WeakMap-backed lifecycle, lazy hydration, fire-and-forget persistence.
+- `GRAMMAR.ebnf` + `docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md` — spec and ampliation RFC.
+- `tests/golden/bounded/` + `tests/integration/golden.test.ts` — 4 golden traces with semantic-diff replay and aggregate coverage assertion.
+- `tests/benchmarks/bounded-vs-a2e-json.ts` + `tests/integration/token-budget.test.ts` — per-regime + cross-tokenizer gates.
+
+### Empirical token cost (cl100k_base / o200k_base, drift ≤1pp per trace)
+
+| Trace | Ratio |
+|---|---:|
+| `large-response-workload` (≥2KB responses) | 14.0% / 14.1% |
+| `call-filter-transform` (mixed mid) | 52.4% / 52.9% |
+| `foreach-save-merge` (small) | 103.8% / 103.5% |
+| `if-wait-history` (small) | 106.5% / 105.6% |
+| **Aggregate** | **31.9% / 32.2%** |
+
+Finding: bounded is a **large-response optimizer**, not a universal compressor. Cross-tokenizer drift <1pp confirms the win is not a cl100k artifact.
+
+### v1.1 → v1.2 migration
+
+None required. Existing clients that don't pass `mode` on session creation continue to default to `"unrestricted"` and behave identically to v1.1. Opting into bounded mode is explicit and scoped per session; persistence, transcript, metrics, idempotency, rate limits, redaction, and all existing operator tooling apply uniformly to both modes.
+
+### Deferred to v1.3
+
+- **SSE streaming for bounded sessions**: JSON path is live; `Accept: text/event-stream` on a bounded session still routes through the unrestricted streaming code. Low priority — bounded responses are point-in-time canonical, not progressive streams.
+- **v1.2 MCP breadth items**: stdio transport, Mcp-Session-Id threading, server-initiated notifications, resources/subscribe, multi-server hardening. See [docs/ROADMAP.md](docs/ROADMAP.md).
+
+### Tests
+
+363 passed / 0 todo across 22 files. Typecheck clean.
+
+---
+
 ## [1.2.0-rc.1] - 2026-04-20
 
 **Theme**: bounded-verb shell. Optional execution mode alongside the default unrestricted bash pipeline. When a session is created with `mode: "bounded"`, `POST /sessions/:id/exec` routes through a closed-grammar DSL instead of `bash -c`. Purely additive — unrestricted mode is byte-identical to v1.1.

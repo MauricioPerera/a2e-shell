@@ -16,9 +16,9 @@ HTTP server exposing a real OS shell as a **primitive tool** for LLM agents. One
 
 ## Status
 
-**v1.2.0-rc.1** — bounded-verb shell shipped as an additive RFC on top of v1.1. All existing v1.1 surface is byte-identical; opting into `mode: "bounded"` on session creation is explicit and scoped per session. See [CHANGELOG.md](./CHANGELOG.md) for the release history and [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](./docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md) for the bounded-mode spec.
+**v1.2.0** — bounded-verb shell GA. Additive on top of v1.1: existing v1.1 surface is byte-identical; opting into `mode: "bounded"` on session creation is explicit and scoped per session. See [CHANGELOG.md](./CHANGELOG.md) for the release history and [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](./docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md) for the bounded-mode spec.
 
-Schema lock from v1.0 remains in effect: routes, error codes, request/response shapes, response headers, and env var names are stable contracts. Only addition this release is the already-reserved `mode: "bounded"` path through the existing `/sessions` and `/exec` endpoints.
+Schema lock from v1.0 remains in effect: routes, error codes, request/response shapes, response headers, and env var names are stable contracts. The only addition this release is the already-reserved `mode: "bounded"` path through the existing `/sessions` and `/exec` endpoints.
 
 ## Design philosophy
 
