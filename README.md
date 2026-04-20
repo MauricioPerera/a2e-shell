@@ -7,7 +7,7 @@ HTTP server exposing a real OS shell as a **primitive tool** for LLM agents. One
 
 - **Shell-as-tool**: the agent writes bash; the server executes. No JSON workflow DSL, no curated tool catalog.
 - **Bounded mode** (v1.2): optional per-session execution under a closed-grammar DSL (8 verbs + 6 meta) instead of bash. For compliance-grade deployments where `eval` / `$(...)` / arbitrary CLIs are off the table. Empirical 14% token cost vs A2E declarative JSON on large-response workloads.
-- **MCP gateway** (v1.1): mount MCP servers on a session, invoke their tools / resources / prompts through the same canonical response pipeline as native bash.
+- **MCP gateway** (v1.1 + v1.3): mount MCP servers on a session, invoke their tools / resources / prompts through the same canonical response pipeline as native bash. HTTP / SSE / **stdio** transports, `Mcp-Session-Id` threading, per-server rate limits (v1.3).
 - **Stateful sessions**: `cwd`, env, variable bindings, and transcript persist across calls.
 - **Catalog layer**: optional git repo of skills/docs/prompts/templates, auto-cloned on session create, with reachability analysis + SHA pinning + shared cache.
 - **Credential discipline**: secrets are resolved from server env vars named by the client; values never touch the LLM, the wire, the transcript, or HTTP error messages.
@@ -16,9 +16,9 @@ HTTP server exposing a real OS shell as a **primitive tool** for LLM agents. One
 
 ## Status
 
-**v1.2.0** — bounded-verb shell GA. Additive on top of v1.1: existing v1.1 surface is byte-identical; opting into `mode: "bounded"` on session creation is explicit and scoped per session. See [CHANGELOG.md](./CHANGELOG.md) for the release history and [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](./docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md) for the bounded-mode spec.
+**v1.3.0** — MCP breadth GA. Adds stdio transport for MCP servers, `Mcp-Session-Id` header threading per MCP 2025-06-18 §2.1.4, and per-server rate limits. Additive on top of v1.2. Existing sessions that don't opt into `transport: "stdio"` or set `rate_limit_rpm` behave byte-identically to v1.2. See [CHANGELOG.md](./CHANGELOG.md) for release history, [`docs/rfcs/002-mcp-stdio-and-breadth.md`](./docs/rfcs/002-mcp-stdio-and-breadth.md) for the v1.3 spec, and [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](./docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md) for the v1.2 bounded-mode spec.
 
-Schema lock from v1.0 remains in effect: routes, error codes, request/response shapes, response headers, and env var names are stable contracts. The only addition this release is the already-reserved `mode: "bounded"` path through the existing `/sessions` and `/exec` endpoints.
+Schema lock from v1.0 remains in effect: routes, error codes, request/response shapes, response headers, and env var names are stable contracts. v1.3 additions: `McpServerSpec.transport: "stdio"` branch and `rate_limit_rpm` optional field on both branches.
 
 ## Design philosophy
 
@@ -36,7 +36,7 @@ See [CONTRACT.md](./CONTRACT.md) for the full specification and acceptance crite
 ```bash
 npm install
 npm run typecheck
-npm test                       # 345 tests
+npm test                       # 384 tests
 npm run bench:bounded          # bounded vs A2E-JSON token cost table
 npm run build && node dist/index.js
 ```

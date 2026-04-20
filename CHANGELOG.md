@@ -6,6 +6,57 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.3.0] - 2026-04-20
+
+Final release of v1.3 — **MCP breadth**. All rc.1 surface is promoted to GA:
+
+- **stdio transport** for MCP servers (subprocess + line-framed JSON-RPC). Unlocks the majority of MCP servers in the wild (stdio-only reference implementations, Postgres, filesystem, git) that previously required an HTTP wrapper.
+- **`Mcp-Session-Id` threading** per MCP 2025-06-18 §2.1.4. Servers with per-session state (OAuth, pagination cursors, cached auth) now stay threaded across requests. Rotated ids adopted transparently. SHA-8 hashes in logs, never raw.
+- **Multi-server hardening**: per-server `rate_limit_rpm` (default 600/min), sliding 60s window, client-side enforcement. Concurrent 4-server load test confirms no global lock contention.
+
+All changes additive on top of v1.2. No breaking changes to v1.1/v1.2 surface. Existing sessions that don't opt into `transport: "stdio"` or set `rate_limit_rpm` behave byte-identically to v1.2.
+
+### Deliverables frozen at this tag
+
+- `src/mcp/schema.ts` — `McpServerSpec` is now a discriminated union on `transport` (http/sse/stdio); both branches accept optional `rate_limit_rpm`.
+- `src/mcp/stdio-client.ts` — subprocess lifecycle + line-framed JSON-RPC. Same `McpClient` interface as HTTP.
+- `src/mcp/connect.ts` — transport-agnostic dispatcher. Resolves stdio bare-name `command` via the session's binary allowlist.
+- `src/mcp/rate-limit.ts` — sliding-60s-window per-server limiter.
+- `src/mcp/client.ts` — Mcp-Session-Id capture + echo + rotation + invalidation retry; SHA-8 hash logger.
+- `tests/integration/mcp-stdio.test.ts`, `mcp-session-id.test.ts`, `mcp-multi-server.test.ts` — 21 new cases total.
+- `tests/fixtures/mcp-stdio-server.mjs` — minimal Node MCP server fixture.
+- `docs/rfcs/002-mcp-stdio-and-breadth.md` — spec.
+
+### Empirical numbers
+
+| Scenario | Wall time |
+|---|---:|
+| 40 `tools/call` × 1 server, sequential, 20ms latency/call | ~800ms |
+| 40 `tools/call` × 4 servers via `Promise.all`, same latency | **<500ms** |
+
+Per-server isolation confirmed — no global lock contention.
+
+### v1.2 → v1.3 migration
+
+None required. Existing `mcp_servers` arrays continue to work byte-identically. Opting into stdio requires explicit `transport: "stdio"` + `command`. `rate_limit_rpm` defaults to 600 — set explicitly to `0` if you want the v1.2 unlimited behavior.
+
+### Deferred to v1.4
+
+- **Server-initiated notification stream** — long-lived GET for `notifications/resources/list_changed` etc.
+- **`resources/subscribe`** — client-driven subscription; pairs with the notification stream.
+- **`command: "npm:@modelcontextprotocol/..."` sugar** — security footgun; needs threat-model work.
+- **Explicit undici Agent with pool size cap** — Node's default keep-alive is sufficient per the v1.3 load test.
+
+### Deferred from v1.2 (continues)
+
+- **SSE streaming for bounded sessions** — low priority; bounded responses are point-in-time canonical.
+
+### Tests
+
+384 passed / 0 todo across 25 files. Typecheck clean.
+
+---
+
 ## [1.3.0-rc.1] - 2026-04-20
 
 **Theme**: MCP breadth. Three additive items on top of v1.2 — stdio transport, `Mcp-Session-Id` header threading, and multi-server hardening. Purely additive; `transport: "stdio"` / `rate_limit_rpm` are opt-in fields, existing sessions are byte-identical. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](docs/rfcs/002-mcp-stdio-and-breadth.md).
