@@ -6,6 +6,24 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.3.2] - 2026-04-20
+
+**Hotfix #2.** Second packaging miscategorization surfaced immediately after the v1.3.1 cutover: `src/parser/grammar.pegjs` is a non-TypeScript asset that `tsc` doesn't copy to `dist/`, so `readFileSync('dist/parser/grammar.pegjs')` at module load throws `ENOENT` in production. Same root cause family as v1.3.1 (peggy devDep → runtime dep): the build tool treats the file as irrelevant for compilation, the test suite runs from `src/` so it never notices.
+
+### Fixed
+
+- `package.json` build script: `tsc` → `tsc && node -e "require('node:fs').cpSync('src/parser/grammar.pegjs','dist/parser/grammar.pegjs')"`. Cross-platform (works on Windows + Linux), zero new dependencies. Verified locally: `npm run build` produces `dist/parser/grammar.pegjs` alongside the compiled `parse.js`.
+
+### Impact
+
+Identical scope to v1.3.1 — bounded mode on prod-built images. Same rebuild remedy. v1.2.0 images also affected by this bug; a v1.2.0-based redeploy needs the same `package.json` patch.
+
+### Postmortem
+
+Both v1.3.1 and v1.3.2 could have been caught by a pre-GA smoke test that (a) built a production Docker image locally and (b) issued one bounded command against it. The test suite runs from source and never exercises the compiled + pruned production layout. **Followup**: add `npm run build && node dist/index.js --self-check-bounded` or a docker smoke step to CI.
+
+---
+
 ## [1.3.1] - 2026-04-20
 
 **Hotfix.** Production deployments (Docker image built with `npm prune --omit=dev` in the runtime stage) crashed the first time any session issued a bounded-mode command — `peggy` was in `devDependencies` but imported at runtime by `src/parser/parse.ts`. This bug shipped in v1.2.0 but was never deployed to prod (the production VPS jumped v1.1 → v1.3 directly), so it only surfaced during the v1.3.0 smoke test.
