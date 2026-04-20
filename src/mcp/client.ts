@@ -20,7 +20,7 @@
 import { A2EError } from "../errors.js";
 import { logger } from "../logging/logger.js";
 import type { Redactor } from "../credentials/redactor.js";
-import type { McpServerSpec } from "./schema.js";
+import type { McpServerSpecHttpT } from "./schema.js";
 import { parseSseStream } from "./sse.js";
 import type {
   JsonRpcNotification,
@@ -67,7 +67,7 @@ export interface McpClient {
 }
 
 export interface ConnectOptions {
-  spec: McpServerSpec;
+  spec: McpServerSpecHttpT;
   /** Process env. Passed explicitly so tests can mock. */
   processEnv: Readonly<Record<string, string | undefined>>;
   /** Session redactor to scrub tokens from error messages. */
@@ -402,7 +402,7 @@ function isMethodNotFound(e: unknown): boolean {
 // --- helpers ----------------------------------------------------------------
 
 function resolveAuthHeaders(
-  spec: McpServerSpec,
+  spec: McpServerSpecHttpT,
   processEnv: Readonly<Record<string, string | undefined>>,
 ): Record<string, string> {
   if (!spec.auth) return {};

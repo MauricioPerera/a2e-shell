@@ -18,7 +18,8 @@ import type { CatalogCache } from "../catalog/cache.js";
 import type { CatalogInfo, CreateSessionRequest, McpServerInfo } from "../io/protocol.js";
 import { logger } from "../logging/logger.js";
 import { sessionsActive, sessionLifecycle } from "../metrics/metrics.js";
-import { connectMcpServer, type McpClient } from "../mcp/client.js";
+import { type McpClient } from "../mcp/client.js";
+import { connectMcp } from "../mcp/connect.js";
 import { buildMcpReachability } from "../mcp/reachability.js";
 
 export interface ManagerConfig {
@@ -78,8 +79,13 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       }
       // Same discipline for MCP auth: the token lives in an env var and we
       // never want its value echoed into any stream surfacing to the agent.
+      // Only HTTP/SSE transports carry auth; stdio uses env overlay so any
+      // sensitive values are already routed through the binary allowlist
+      // surface, not the MCP client.
       for (const server of req.mcp_servers ?? []) {
-        if (server.auth?.type === "token") redactKeys.push(server.auth.env_var);
+        if (server.transport !== "stdio" && server.auth?.type === "token") {
+          redactKeys.push(server.auth.env_var);
+        }
       }
       const redactor = buildRedactor(redactKeys, process.env);
       validateEnvMap(req.initial_env);
@@ -135,10 +141,11 @@ export function createManager(cfg: ManagerConfig): SessionManager {
       if (req.mcp_servers && req.mcp_servers.length > 0) {
         try {
           for (const spec of req.mcp_servers) {
-            const client = await connectMcpServer({
+            const client = await connectMcp({
               spec,
               processEnv: process.env,
               redactor,
+              policy,
             });
             mcpClients.set(spec.id, client);
           }
