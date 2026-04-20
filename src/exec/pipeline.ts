@@ -53,6 +53,28 @@ export async function executeTurn(
   sink?: ExecSink,
 ): Promise<ExecResponse> {
   const start = Date.now();
+  // Bounded mode has its own runtime that does not go through bash/spawn.
+  // Fork early — we still emit the standard exec metrics + log below so
+  // observability is uniform regardless of mode.
+  if (session.policy.mode === "bounded") {
+    const { executeBoundedTurn } = await import("./pipeline-bounded.js");
+    const response = await executeBoundedTurn(session, req);
+    const outcome: "ok" | "error" = response.error ? "error" : "ok";
+    execTotal.inc({ outcome });
+    if (outcome === "error" && response.error) errorsTotal.inc({ code: response.error.code });
+    execDurationMs.observe(Date.now() - start);
+    logger.info({
+      event: "exec",
+      session_id: session.id,
+      mode: "bounded",
+      outcome,
+      duration_ms: Date.now() - start,
+      command_bytes: req.command.length,
+      ...(outcome === "error" && response.error ? { error_code: response.error.code } : {}),
+      ...(response.truncated ? { truncated: true } : {}),
+    });
+    return response;
+  }
   try {
     const { response, outcome } = await runTurn(session, req, sink);
     execTotal.inc({ outcome });

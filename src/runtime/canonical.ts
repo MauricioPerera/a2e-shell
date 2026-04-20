@@ -144,7 +144,7 @@ export function buildPreview(value: RuntimeValue, shape: Shape): { preview: stri
 
 // --- response builders ------------------------------------------------------
 
-function describeShape(shape: Shape): string {
+export function describeShape(shape: Shape): string {
   switch (shape.kind) {
     case "scalar": return `scalar[${shape.bytes}B]`;
     case "record": return `record[${shape.keys?.length ?? 0}keys]`;

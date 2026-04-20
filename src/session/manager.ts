@@ -63,12 +63,9 @@ export function createManager(cfg: ManagerConfig): SessionManager {
   return {
     async create(req) {
       const id = crypto.randomUUID();
-      if (req.mode === "bounded") {
-        throw new A2EError(
-          "NOT_IMPLEMENTED_V1",
-          "bounded mode is reserved for v2; use unrestricted",
-        );
-      }
+      // Bounded mode became a real execution path as of the bounded-verb RFC.
+      // The session carries policy.mode === "bounded"; exec/pipeline.ts routes
+      // to the bounded runtime dispatcher at turn time.
       const policy = resolvePolicy({
         mode: req.mode,
         ...(req.capabilities ? { overrides: req.capabilities } : {}),

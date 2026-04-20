@@ -76,13 +76,53 @@ describe("HTTP server", () => {
     expect(typeof body.session_id).toBe("string");
   });
 
-  it("POST /sessions with bounded mode → 400 NOT_IMPLEMENTED_V1", async () => {
+  it("POST /sessions with bounded mode → 201 bounded session created", async () => {
     const { app, sessionsDir } = makeApp();
     cleanup = sessionsDir;
     const res = await postJson(app, "/sessions", { mode: "bounded" });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("NOT_IMPLEMENTED_V1");
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { session_id: string; mode: string };
+    expect(body.mode).toBe("bounded");
+    expect(typeof body.session_id).toBe("string");
+  });
+
+  it("bounded session: exec with meta+verb works end-to-end", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const create = await postJson(app, "/sessions", { mode: "bounded" });
+    expect(create.status).toBe(201);
+    const { session_id } = (await create.json()) as { session_id: string };
+
+    // Bind a list, then describe it.
+    const r1 = await postJson(app, `/sessions/${session_id}/exec`, {
+      command: "save [1,2,3] as nums",
+    });
+    expect(r1.status).toBe(200);
+    const b1 = (await r1.json()) as { status_line: string; binding: string; error?: unknown };
+    expect(b1.error).toBeUndefined();
+    expect(b1.status_line).toMatch(/^OK \| save →/);
+    expect(b1.binding).toBe("$nums");
+
+    const r2 = await postJson(app, `/sessions/${session_id}/exec`, {
+      command: "describe $nums",
+    });
+    const b2 = (await r2.json()) as { preview: unknown; error?: unknown };
+    expect(b2.error).toBeUndefined();
+    expect(b2.preview).toMatchObject({ kind: "list", rows: 3 });
+  });
+
+  it("bounded session: parse failure returns PARSE_ERROR in canonical response", async () => {
+    const { app, sessionsDir } = makeApp();
+    cleanup = sessionsDir;
+    const create = await postJson(app, "/sessions", { mode: "bounded" });
+    const { session_id } = (await create.json()) as { session_id: string };
+    const r = await postJson(app, `/sessions/${session_id}/exec`, {
+      command: "curl -sS https://example.com",
+    });
+    expect(r.status).toBe(200);
+    const body = (await r.json()) as { status_line: string; error: { code: string } };
+    expect(body.status_line).toMatch(/^ERR \| PARSE_ERROR/);
+    expect(body.error.code).toBe("PARSE_ERROR");
   });
 
   it("POST /sessions with invalid mode → 400 PARSE_ERROR", async () => {
