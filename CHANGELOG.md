@@ -6,6 +6,74 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.2.0-rc.1] - 2026-04-20
+
+**Theme**: bounded-verb shell. Optional execution mode alongside the default unrestricted bash pipeline. When a session is created with `mode: "bounded"`, `POST /sessions/:id/exec` routes through a closed-grammar DSL instead of `bash -c`. Purely additive — unrestricted mode is byte-identical to v1.1.
+
+Shipped as an ampliation RFC — see [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md).
+
+### Added
+
+- **Closed-grammar parser** (`src/parser/`): peggy-compiled EBNF from [`GRAMMAR.ebnf`](GRAMMAR.ebnf). 8 verbs (`call`, `filter`, `transform`, `if`, `foreach`, `save`, `wait`, `merge`) + 6 meta (`describe`, `head`, `show`, `env`, `history`, `help`). Typed AST with discriminated unions. Enforces R2 (interpolation regex), R5 (`$_` reserved), R7 (MAX_LINE_LENGTH=4096, MAX_BLOCK_DEPTH=4).
+- **Bounded runtime** (`src/runtime/`): session state (bindings + TTL + transcript), canonical response builder with shape inference (scalar/record/list/table/bytes/void), value + predicate + path evaluation, dispatcher. 512B preview truncation with row-aware row-count for list/table.
+- **Verbs** (`src/verbs/`): all 8 executable end-to-end.
+  - `call` HTTP with `--header` / `--body` / `--query` / `--timeout`, domain allowlist, content-type-based decoding.
+  - `call` CLI via `spawn(shell:false)` with binary allowlist, SIGKILL timeout, UTF-8/Buffer auto-detect.
+  - `if` / `foreach` blocks (re-entrant dispatch). `foreach --on-error=abort|continue`.
+  - `save` accepts interpolated names (`save $x as "stats_${$repo.name}"`) — enables per-iteration accumulators in `foreach` bodies.
+  - `filter` / `transform` (pick/omit/rename/set/map) / `merge` (inner/left/right/outer, right-wins on overlap) / `wait`.
+- **Meta commands** (`src/meta/`): all 6 executable. `show` bypasses the preview-truncation budget (only command that does).
+- **HTTP wiring** (`src/exec/pipeline-bounded.ts`): WeakMap-side-table bridges the outer HTTP session to a bounded runtime session (lazy init, lifetime-coupled). `executeTurn` forks on `policy.mode === "bounded"` and dynamic-imports the bounded dispatcher. Canonical response → ExecResponse translation preserves the existing HTTP contract.
+- **Golden traces** (`tests/golden/bounded/`): 4 fixtures covering 8/8 verbs + 6/6 meta + 4 rejection paths.
+- **Golden replay harness** (`tests/integration/golden.test.ts`): structural validation + aggregate coverage assertion + per-trace replay. `grammar-rejected` byte-precise; HTTP-dependent traces use global `fetch` stub + semantic diff (OK/ERR, verb, shape.kind with list↔table relaxation, rows, binding, error.code).
+- **Token-cost benchmark** (`tests/benchmarks/bounded-vs-a2e-json.ts`, `npm run bench:bounded`): measures bounded vs A2E declarative JSON per trace with cl100k_base. CLI + library (importable by tests). Gates live in `tests/integration/token-budget.test.ts`.
+
+### Empirical token cost vs A2E-JSON
+
+The RFC originally claimed "≤20% tokens universal". Measurement refined this to three regimes:
+
+| Trace | Regime | Ratio |
+|---|---|---:|
+| `large-response-workload` (synthetic, ≥2KB responses) | large | **14%** |
+| `call-filter-transform` (mixed ~600B responses) | medium | **53%** |
+| `foreach-save-merge` (small payloads <200B) | small | 104% |
+| `if-wait-history` (small payloads <200B) | small | 106% |
+| **Aggregate** | | **32%** |
+
+**Finding**: bounded wins on large responses (preview truncation amortizes) and matches parity on small responses (canonical-wrapper overhead dominates when there's nothing big to truncate). The method is a **large-response optimizer**, not a universal compressor. CHANGELOG + RFC + README all reflect this.
+
+### Gates (RFC §6)
+
+Live in `tests/integration/token-budget.test.ts`; all green:
+
+- `large-response-workload` ≤ 30% (empirical 14%)
+- `call-filter-transform` ≤ 70% (empirical 53%)
+- Small traces ≤ 130% (empirical 104-106%)
+- Aggregate ≤ 50% (empirical 32%)
+
+Margins are generous on top of empirical to absorb tokenizer/shape-inference drift without hiding real regressions.
+
+### Changed
+
+- `GRAMMAR.ebnf` already existed at the repo root (authored in v1.0-rc.3 as the bounded-mode spec). It is now **executable** — the peggy grammar at `src/parser/grammar.pegjs` derives from it.
+- `docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md` §1 and §6 updated to reflect the per-regime cost claims, replacing the universal "≤20%" with an honest breakdown.
+
+### Not in this release (deferred)
+
+- **Persistence of bounded session state**: a restored bounded session starts with empty bindings. The outer Session's `state.json` serializes the unrestricted-mode map only.
+- **SSE streaming for bounded**: the JSON path is live; `Accept: text/event-stream` on a bounded session still routes through the unrestricted streaming code and will produce no useful output.
+- **Real `--parallel=N` in `foreach`**: flag is accepted and parsed but iterations run sequentially. Real concurrency needs per-iteration scope stack for the iterVar.
+
+### Tests
+
+345 passed across 21 files. Typecheck clean.
+
+### Migration
+
+None required. Existing sessions that don't pass `mode` continue to default to `"unrestricted"` and behave identically to v1.1. Opting into bounded is explicit per session.
+
+---
+
 ## [1.1.0] - 2026-04-19
 
 Final release of v1.1 — **MCP gateway (inbound)**. All RFC 001 scope is implemented end-to-end:

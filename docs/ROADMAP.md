@@ -177,9 +177,30 @@ Complete scope per RFC 001:
 
 ---
 
-## v1.2 — MCP breadth + operability
+## v1.2 — Bounded mode + MCP breadth
 
 Additive scope on top of v1.1. No breaking changes to v1.1 surface.
+
+### Bounded mode — **shipped (rc.1)**
+
+- `GRAMMAR.ebnf` enforced at runtime. `mode: "bounded"` session rejects any command that doesn't parse against the grammar.
+- Parser emits canonical AST → validated → executed through a restricted interpreter (not bash).
+- 8 verbs (`call`, `filter`, `transform`, `if`, `foreach`, `save`, `wait`, `merge`) + 6 meta (`describe`, `head`, `show`, `env`, `history`, `help`).
+- `call` HTTP (domain allowlist + timeouts + content-type decoding) and CLI (binary allowlist + SIGKILL + UTF-8/Buffer auto-detect).
+- `if` / `foreach` blocks with `--on-error=abort|continue`. `foreach --parallel=N` accepted but sequential in rc.1 (scope-stack needed for real concurrency).
+- Interpolated save names (`save $x as "stats_${$repo.name}"`) — enables per-iteration accumulators.
+- Empirical 14% token cost vs A2E declarative JSON on large-response workloads; ~50% on medium; parity on small. Gated in `tests/integration/token-budget.test.ts`.
+- Spec: [`docs/rfcs/RFC-bounded-verb-shell-CONTRACT.md`](rfcs/RFC-bounded-verb-shell-CONTRACT.md).
+- Use case: compliance-grade deployments where `eval` / `$(...)` / arbitrary CLIs are not acceptable even with allowlist enforcement.
+
+### Bounded mode — deferred to v1.3
+
+- **Persistence**: bounded session's `BoundedRuntime` bindings + transcript not yet serialized to `state.json`. Restored sessions start empty.
+- **SSE streaming for bounded**: JSON path is live; `Accept: text/event-stream` on bounded sessions still routes through the unrestricted code.
+- **Real `--parallel=N` in foreach**: needs per-iteration scope stack so `$item` can be bound N ways concurrently.
+- **Multi-model benchmark**: run `bench:bounded` against Claude / GPT-4 / Gemma tokenizers to verify cross-model stability of the ratios.
+
+### MCP breadth (still pending)
 
 - **stdio transport for MCP servers**: spawn MCP server as a subprocess, pipe line-framed JSON-RPC. Enables local-only MCP servers without HTTP exposure. Subprocess lifecycle at session create/delete.
 - **Mcp-Session-Id threading**: for MCP servers that maintain state, thread the session id header across subsequent requests.
@@ -191,14 +212,7 @@ Additive scope on top of v1.1. No breaking changes to v1.1 surface.
 
 ## v2.0 — Expressiveness
 
-**Theme**: reach into the catalog's bounded-mode promise and federated knowledge.
-
-### Bounded mode
-
-- `GRAMMAR.ebnf` enforced at runtime. `mode: "bounded"` session rejects any command that doesn't parse against the grammar.
-- Parser emits canonical AST → validated → executed through a restricted interpreter (not bash).
-- Use case: compliance-grade deployments where `eval` / `$(...)` / arbitrary CLIs are not acceptable even with allowlist enforcement.
-- Documented trade-off: expressiveness drops sharply; only verbs from the grammar are available.
+**Theme**: federated knowledge and plugin-extensible DSL (bounded mode is now in v1.2; this release builds on top).
 
 ### Federated catalog
 
