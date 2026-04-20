@@ -288,3 +288,240 @@ Typical reverse-proxy setup:
 - [ ] Sessions volume monitored for disk pressure
 - [ ] Catalog cache dir on a volume with auto-snapshot rotation or size cap
 - [ ] Container runs non-root (the shipped Dockerfile does this; preserve it)
+
+---
+
+## Runbooks
+
+Each subsection is the landing page for a Prometheus alert's `runbook_url` annotation. All alerts are defined in [`deploy/monitoring/alert.rules.yml`](../deploy/monitoring/alert.rules.yml).
+
+Format: symptoms → immediate checks → remediation → why this happens. Keep edits tight — a runbook that runs past one screen won't get read at 3am.
+
+Prerequisites for every runbook below:
+
+- SSH (Tailscale or direct) to the VPS running a2e-shell.
+- `docker`, `curl`, `journalctl` available on the host.
+- Grafana open at https://grafana.ardf.dev (the "a2e-shell — overview" dashboard is home).
+
+### service-down
+
+**Alert**: `A2eShellDown` · **Severity**: critical
+
+Prometheus can't reach `/metrics` for 1 minute. The container is down, the port binding is broken, or the Node process is wedged.
+
+**Immediate checks** (30 seconds):
+
+```bash
+# Is the container alive?
+ssh root@<vps> 'docker ps --filter name=a2e-shell --format "{{.Status}}"'
+
+# Does the app respond on its loopback port?
+ssh root@<vps> 'curl -fsS --max-time 5 http://127.0.0.1:8090/healthz'
+
+# Public reachability (through Cloudflare + nginx)
+curl -fsSI https://a2e.ardf.dev/healthz
+```
+
+**Remediation decision tree**:
+
+| Symptom | Action |
+|---|---|
+| `docker ps` shows `Exited (code N)` | `docker logs a2e-shell \| tail -50` to see why. If OOM, bump container memory. If crash loop, check for corrupt `sessions` volume. |
+| `docker ps` empty (no container) | `docker start a2e-shell` or recreate via [release playbook](RELEASING.md#after-tagging-prod-deploy). |
+| Container `Up (unhealthy)` but `/healthz` loops forever | `docker restart a2e-shell`. If restart doesn't clear it, inspect the event loop: `docker exec a2e-shell kill -USR1 1` (dumps async hooks to stderr, visible via `docker logs`). |
+| Public 502 but loopback OK | nginx is the problem: `nginx -t && systemctl reload nginx`. |
+
+**Why this happens**: usually one of three: uncaught rejection in an async handler (see [`A2eShellInternalErrorsFiring`](#internal-errors)), memory exhaustion (see [`A2eShellHighMemory`](#high-memory)), or OS-level kill (OOM killer, manual `docker stop`). Check `dmesg \| grep -i kill` if RSS was trending up.
+
+---
+
+### internal-errors
+
+**Alert**: `A2eShellInternalErrorsFiring` · **Severity**: critical
+
+Any `error.code=INTERNAL` means an uncaught exception slipped past all handlers — a bug, not a user error.
+
+**Immediate checks**:
+
+```bash
+# The unhandled-error log entries carry the stack trace:
+ssh root@<vps> 'docker logs a2e-shell 2>&1 | grep http.error.unhandled | tail -5'
+
+# How many users hit it in the last 5m?
+ssh root@<vps> 'curl -sS "http://127.0.0.1:9090/api/v1/query?query=sum(rate(a2e_errors_total\{code=%22INTERNAL%22\}%5B5m%5D))" | jq .data.result[0].value[1]'
+```
+
+**Remediation**:
+
+1. **Read the stack trace**. The `err.stack` field in the log entry points to the exact file/line.
+2. If the stack references a packaging/asset path (`ERR_MODULE_NOT_FOUND`, `ENOENT: ... /dist/...`), you shipped a bug from the family that broke v1.3.0. See [RELEASING.md postmortem](RELEASING.md#postmortem) — the docker-smoke CI gate exists to catch these. If it somehow slipped through, rebuild with the affected file moved to `dependencies` / copied in the build step.
+3. For any other stack: open an issue with the full trace, mark it `bug`, and **keep the broken version running only if the error rate is low**. If `INTERNAL` rate > 1/sec sustained, roll back via the [release playbook](RELEASING.md#hotfix-protocol).
+
+**Why this happens**: the app is designed to convert everything to a canonical `A2EError` with a specific code. `INTERNAL` fires when something escapes that conversion — historically packaging bugs (v1.3.0 peggy / grammar.pegjs) and a few unhandled promise rejections.
+
+---
+
+### high-error-rate
+
+**Alert**: `A2eShellHighErrorRate` · **Severity**: warning
+
+More than 25% of requests over the last 5 minutes returned some error code.
+
+**Immediate checks**:
+
+```bash
+# Break the rate down by code to identify the source:
+curl -sS -u 'admin:<pw>' 'https://grafana.ardf.dev/api/datasources/proxy/uid/a2e-prometheus/api/v1/query?query=sum%20by%20(code)%20(rate(a2e_errors_total%5B5m%5D))' | jq '.data.result[] | {code: .metric.code, rate: .value[1]}'
+```
+
+**Remediation**:
+
+| Dominant code | Likely cause | First step |
+|---|---|---|
+| `UNAUTHORIZED` | token rotated or client misconfigured | rotate back or fix the client |
+| `PARSE_ERROR` | bounded-mode grammar mismatch (agent using wrong syntax) | check [CHANGELOG](../CHANGELOG.md) for grammar changes; LLM prompt may need refresh |
+| `CAPABILITY_DENIED` | allowlist too tight or agent asked for unexpected binary | review `A2E_DEFAULT_BINARIES_ALLOWLIST` + per-session `capabilities.binaries_allowlist` |
+| `RATE_LIMITED` | see [rate-limit-sustained](#rate-limit-sustained) |
+| `SCOPE_MISS` | usually agent-side bug referencing unbound `$var`; benign if isolated |
+| `INTERNAL` | see [internal-errors](#internal-errors) — this is the one that matters |
+
+If no single code dominates, check whether `a2e_http_requests_total` has spiked — a DoS-shape surge can push the ratio up without a real bug. Cross-reference with Cloudflare firewall events.
+
+---
+
+### p95-latency-high
+
+**Alert**: `A2eShellP95LatencyHigh` · **Severity**: warning
+
+Exec turns are taking >1s at p95 for 5+ minutes.
+
+**Immediate checks**:
+
+```bash
+# p95 per-route (narrows down to specific tool calls)
+curl -sS -u 'admin:<pw>' 'https://grafana.ardf.dev/api/datasources/proxy/uid/a2e-prometheus/api/v1/query?query=histogram_quantile(0.95,sum%20by%20(route,le)%20(rate(a2e_http_request_duration_ms_bucket%5B5m%5D)))' | jq '.data.result[] | {route: .metric.route, p95_ms: .value[1]}'
+
+# Is the event loop saturated?
+curl -sS -u 'admin:<pw>' 'https://grafana.ardf.dev/api/datasources/proxy/uid/a2e-prometheus/api/v1/query?query=nodejs_eventloop_lag_seconds' | jq .data.result[0].value[1]
+```
+
+**Remediation**:
+
+1. **Event loop lag > 200ms** → see [event-loop-lag-high](#event-loop-lag-high). Same underlying cause.
+2. **p95 concentrated on one route**: probably the upstream that route hits. Check MCP server response times (`a2e_mcp_request_duration_ms_bucket`), catalog mirror sync (large partial clones stall), or a specific bash subprocess blocking.
+3. **p95 elevated across the board without ELL spike**: network to Cloudflare/upstreams is the bottleneck. Check `traceroute` from the VPS.
+4. **No upstream dependency slow**: bounded-mode sessions doing `foreach --parallel=N` with large N may queue on rate limits. Check [rate-limit-sustained](#rate-limit-sustained) in parallel.
+
+**Why this happens**: the histogram captures end-to-end turn time, including all pipeline stages (auth, interpolation, spawn, output formatting). Any stage can spike. p95 is sensitive to a handful of slow outliers — 10% of turns being slow is enough to trip this.
+
+---
+
+### event-loop-lag-high
+
+**Alert**: `A2eShellEventLoopLagHigh` · **Severity**: warning
+
+Node's event loop is stuck for more than 200ms — the process is CPU-saturated or blocked on synchronous I/O. New requests queue.
+
+**Immediate checks**:
+
+```bash
+# Current lag value
+ssh root@<vps> 'curl -sS http://127.0.0.1:8090/metrics | grep nodejs_eventloop_lag_seconds'
+
+# CPU load on the host (container shares host CPU)
+ssh root@<vps> 'top -bn1 | head -15'
+
+# Flame-graph-style blocked ops snapshot:
+ssh root@<vps> 'docker exec a2e-shell kill -USR1 1 && docker logs --tail 100 a2e-shell'
+# (prints async hook state + recent setImmediate backlog)
+```
+
+**Remediation**:
+
+1. If the host is CPU-saturated (other containers fighting for CPU), that's the root cause — either add CPU or isolate a2e-shell with `--cpus=` cgroup limits.
+2. If the host has CPU headroom but a2e-shell's own process is saturated: someone is doing a huge synchronous operation. Common culprits: enormous regex over big input, JSON.parse of 100MB+, unbounded `filter` on a giant in-memory list.
+3. Restart as a stopgap: `docker restart a2e-shell`. Fix the upstream cause before it recurs.
+
+**Why this happens**: Node is single-threaded for JS execution. Any synchronous call that takes >50ms starves every other request. The canonical a2e-shell pipeline offloads I/O to async, so sustained lag means someone bypassed that (or a bug introduced a sync hot path).
+
+---
+
+### high-memory
+
+**Alert**: `A2eShellHighMemory` · **Severity**: warning
+
+Process RSS exceeded 800 MiB for 10 minutes. Normal baseline is 80-120 MiB.
+
+**Immediate checks**:
+
+```bash
+# How many sessions alive?
+ssh root@<vps> 'curl -sS http://127.0.0.1:8090/metrics | grep a2e_sessions_active'
+
+# Session binding size totals (if any session has accumulated >100MB of bindings)
+ssh root@<vps> 'ls -lh /var/lib/a2e-shell/sessions/*/state.json 2>/dev/null | sort -k5 -h | tail -5'
+```
+
+**Remediation**:
+
+1. **Sessions > baseline × 2** → bindings may be accumulating. Check [sessions-high](#sessions-high) runbook. Sessions whose `state.json` is >50MB are the concrete leak sites; delete via `DELETE /sessions/:id` with that id.
+2. **Sessions normal but RSS climbing** → real leak (Buffer from exec not freed, listener never removed, etc.). Restart is the stopgap: `docker restart a2e-shell`. Open a bug with a heap snapshot: `docker exec a2e-shell kill -USR2 1 && docker logs a2e-shell | grep 'heapsnapshot'`.
+3. **RSS high for minutes after restart** → not a leak, baseline shifted. Raise the alert threshold in `alert.rules.yml`.
+
+**Why this happens**: every session holds its bindings in-process until DELETE or TTL expiry. An agent that binds 500 MB of data and never DELETEs the session keeps that memory forever. TTL sweeper runs every 60s to limit this.
+
+---
+
+### sessions-high
+
+**Alert**: `A2eShellSessionsHigh` · **Severity**: warning
+
+More than 500 sessions registered simultaneously for 10+ minutes.
+
+**Immediate checks**:
+
+```bash
+# Exact count + trend
+ssh root@<vps> 'curl -sS http://127.0.0.1:8090/metrics | grep -E "a2e_sessions_active|a2e_sessions_total"'
+
+# Sessions on disk (should match active)
+ssh root@<vps> 'ls /var/lib/a2e-shell/sessions/ | wc -l'
+
+# Sessions NOT being cleaned up at TTL — should be empty:
+ssh root@<vps> 'find /var/lib/a2e-shell/sessions/ -maxdepth 1 -mindepth 1 -mmin +60 -type d | wc -l'
+```
+
+**Remediation**:
+
+1. **Sessions on disk ≫ active sessions** → TTL sweeper has a backlog. Check `docker logs a2e-shell | grep session.sweep` — if the sweeper is erroring, the stale sessions accumulate. Manual sweep: `find /var/lib/a2e-shell/sessions/ -maxdepth 1 -mmin +120 -type d -exec rm -rf {} +`.
+2. **Active sessions ≫ normal traffic shape** → a client is creating without DELETEing. Check transcript for client patterns; reach out to the client owner. Short-term: lower `A2E_SESSION_TTL_S` to force faster reaping.
+3. **Legitimate traffic spike** → sessions are fine, the threshold is wrong. Raise it in `alert.rules.yml`.
+
+**Why this happens**: `POST /sessions` without a matching `DELETE /sessions/:id` (plus TTL not yet expired). Typical baseline: a few sessions at rest, maybe 10-20 under active load.
+
+---
+
+### rate-limit-sustained
+
+**Alert**: `A2eShellRateLimitSustained` · **Severity**: warning
+
+Rate-limit rejections > 1/sec for 10+ minutes.
+
+**Immediate checks**:
+
+```bash
+# Which bucket is hitting the limit?
+curl -sS -u 'admin:<pw>' 'https://grafana.ardf.dev/api/datasources/proxy/uid/a2e-prometheus/api/v1/query?query=sum%20by%20(bucket)%20(rate(a2e_rate_limit_hits_total%5B5m%5D))' | jq '.data.result[] | {bucket: .metric.bucket, rate: .value[1]}'
+```
+
+**Remediation** (by bucket):
+
+| Bucket | Meaning | Action |
+|---|---|---|
+| `session` | Per-session request limit hit — client is bursting beyond `A2E_RATE_LIMIT_PER_MINUTE` | If legitimate load, bump the env var + `docker restart a2e-shell`. If abusive, identify the client via request logs and revoke their token. |
+| `create` | Too many `POST /sessions` per minute — probably an agent in a session-create loop | Same: bump cap or revoke. Check the transcript for the actual usage. |
+| `mcp` | Per-MCP-server cap (`rate_limit_rpm` on a spec) | The agent is calling one MCP server too hard. Raise `rate_limit_rpm` or throttle the agent prompt. |
+
+If ALL three buckets are hitting their limits simultaneously → you're almost certainly under a misbehaving client. Revoke the token and investigate.
+
+**Why this happens**: rate limits exist to protect the server from runaway clients AND to protect downstream MCP servers from agent loops. A 10-minute sustained breach indicates it's working as designed, not a false positive.

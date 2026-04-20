@@ -4,8 +4,9 @@
 #   - `severity`: "critical" (wake someone) or "warning" (next business day)
 #   - `summary`: one-line identifier for the alert — shown in notification titles
 #   - `description`: what the alert means + current value + how to diagnose
-#   - `runbook_url` (optional): link to the handling procedure (left as a
-#      placeholder; fill in once there's internal docs to point at)
+#   - `runbook_url`: link to the handling procedure. Every alert points to an
+#      anchor in docs/OPERATIONS.md#runbooks. Keep the runbooks in sync when
+#      adding / removing alerts.
 #
 # `for:` durations are tuned for prod traffic shape (low, bursty). Short
 # `for:` windows fire on transient blips; long `for:` windows miss real
@@ -49,6 +50,7 @@ groups:
             means users are hitting it right now.
             Current rate: {{ $value | printf "%.3f" }} errors/sec over the last 5m.
             Check `docker logs a2e-shell | grep http.error.unhandled`.
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#internal-errors"
 
       # Elevated overall error rate (any code) — noisy clients, broken
       # integrations, or surface-level bugs.
@@ -70,6 +72,7 @@ groups:
             Current ratio: {{ $value | printf "%.2f" }}.
             Break down by code in the overview dashboard "Errors by code"
             panel to identify whether it's auth, parse, or upstream failures.
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#high-error-rate"
 
   - name: a2e-shell-performance
     interval: 30s
@@ -91,6 +94,7 @@ groups:
             Likely causes: upstream MCP server slowness, rate-limit queueing,
             or CPU saturation. Cross-check with event-loop-lag and MCP
             server response times.
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#p95-latency-high"
 
       - alert: A2eShellEventLoopLagHigh
         expr: nodejs_eventloop_lag_seconds{job="a2e-shell"} > 0.2
@@ -105,6 +109,7 @@ groups:
             for 3m). The process is CPU-saturated or blocked on sync I/O —
             new requests will queue. Check container CPU usage and look for
             large synchronous operations (huge regex, JSON.parse of >10MB).
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#event-loop-lag-high"
 
       # Memory slowly climbing past 800MB over 10m is the classic leak signal.
       # Adjust the threshold to match your deployment's baseline.
@@ -122,6 +127,7 @@ groups:
             Normal baseline is ~80-120 MiB (N sessions, modest catalog);
             sustained 800 MiB+ typically means a binding leak (sessions
             not being reaped) or a Buffer from /exec never released.
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#high-memory"
 
   - name: a2e-shell-capacity
     interval: 30s
@@ -139,6 +145,7 @@ groups:
             The manager's per-session memory (~1-10 MiB) means 500+ sessions
             push RSS toward the gigabyte range. If this isn't expected
             traffic, sessions are leaking — check TTL + explicit DELETE calls.
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#sessions-high"
 
       # Sustained rate-limit rejections suggest either a misbehaving client
       # or a too-tight cap. Either way, worth a human look.
@@ -156,3 +163,4 @@ groups:
             "Rate limit hits" panel), or the cap is too tight for real
             traffic. `a2e_rate_limit_hits_total` buckets identify which
             limit (session vs per-MCP-server vs create).
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#rate-limit-sustained"
