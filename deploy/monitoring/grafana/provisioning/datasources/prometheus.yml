@@ -1,0 +1,16 @@
+# Grafana datasource for the a2e-shell Prometheus. Provisioned at container
+# start so the dashboard below can reference it by name without a manual
+# UI step.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: a2e-prometheus
+    type: prometheus
+    access: proxy
+    # Host networking: prometheus listens on 127.0.0.1:9090 and grafana
+    # shares the host namespace, so 127.0.0.1 points at the same place.
+    url: http://127.0.0.1:9090
+    isDefault: true
+    editable: false
