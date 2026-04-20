@@ -14,6 +14,14 @@ global:
   external_labels:
     host: "a2e.ardf.dev"
 
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:9093"]
+
 scrape_configs:
   - job_name: "a2e-shell"
     # a2e-shell exposes Prometheus format at /metrics without auth.

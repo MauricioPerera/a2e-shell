@@ -1,13 +1,15 @@
 # a2e-shell — observability stack
 
-Prometheus + Grafana sidecar for scraping `a2e-shell`'s `/metrics` endpoint and visualizing traffic / latency / errors / rate limits / process health.
+Prometheus + Alertmanager + Grafana sidecar for scraping `a2e-shell`'s `/metrics` endpoint, visualizing traffic / latency / errors / rate limits / process health, and firing alerts when availability or performance regress.
 
 ## What's here
 
 ```
 deploy/monitoring/
-├── docker-compose.yml                  ← prometheus + grafana services
-├── prometheus.yml                      ← scrape config (one target: a2e-shell)
+├── docker-compose.yml                  ← prometheus + alertmanager + grafana
+├── prometheus.yml                      ← scrape config + alertmanager target + rule files
+├── alert.rules.yml                     ← alerting rules (7 alerts, critical + warning)
+├── alertmanager.yml                    ← routes + webhook receiver + inhibit rules
 └── grafana/provisioning/
     ├── datasources/prometheus.yml      ← auto-connect Grafana to Prometheus
     └── dashboards/
@@ -51,6 +53,46 @@ One screen, eight panels:
 | Exec success rate | ok-outcome `a2e_exec_total` rate | One-liner health signal |
 | Process RSS | `process_resident_memory_bytes` | Memory leak detector |
 | Event loop lag | `nodejs_eventloop_lag_seconds` | CPU pressure — sustained >50ms means saturation |
+
+## Alerts (7 rules shipped)
+
+Defined in `alert.rules.yml`, evaluated every 30s by Prometheus:
+
+| Alert | Severity | Fires when | Sustained |
+|---|---|---|---|
+| `A2eShellDown` | critical | `/metrics` scrape fails | 1m |
+| `A2eShellInternalErrorsFiring` | critical | any `code="INTERNAL"` rate > 0 | 2m |
+| `A2eShellHighErrorRate` | warning | error/request ratio > 25% | 5m |
+| `A2eShellP95LatencyHigh` | warning | p95 exec > 1000ms | 5m |
+| `A2eShellEventLoopLagHigh` | warning | Node event-loop lag > 200ms | 3m |
+| `A2eShellHighMemory` | warning | process RSS > 800 MiB | 10m |
+| `A2eShellSessionsHigh` | warning | active sessions > 500 | 10m |
+| `A2eShellRateLimitSustained` | warning | rate-limit rejections > 1/sec | 10m |
+
+Critical alerts get a shorter `group_wait` (10s) + `repeat_interval` (30m) so they don't sit in aggregation windows behind warnings. Inhibit rules mute every a2e-shell alert when `A2eShellDown` is firing — the service being down is upstream of latency/error-rate warnings.
+
+### Routing to a real receiver
+
+`alertmanager.yml` ships with a **placeholder webhook** at `http://127.0.0.1:5001/a2e-alerts` — this intentionally fails closed so alerts stay visible in the Alertmanager UI (http://127.0.0.1:9093) until the operator plugs in a real endpoint. To push notifications to Discord / Slack / Telegram / email, replace the `webhook_configs.url` in `alertmanager.yml` and `docker compose restart alertmanager`. Examples for each common receiver are in the [Alertmanager docs](https://prometheus.io/docs/alerting/latest/notification_examples/).
+
+Alerts are queryable even without a configured receiver:
+
+```bash
+curl -sS http://127.0.0.1:9093/api/v2/alerts | jq
+```
+
+### Verifying alerts fire
+
+Quick end-to-end test:
+
+```bash
+# 1. Stop a2e-shell briefly to trigger A2eShellDown (1m for: window)
+docker stop a2e-shell
+sleep 80
+curl -sS http://127.0.0.1:9093/api/v2/alerts | jq '.[] | select(.status.state=="active") | .labels.alertname'
+# Expected: ["A2eShellDown"]
+docker start a2e-shell
+```
 
 ## Networking
 

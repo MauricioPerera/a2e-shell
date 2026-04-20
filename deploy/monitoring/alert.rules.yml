@@ -1,0 +1,158 @@
+# Prometheus alerting rules for a2e-shell.
+#
+# Conventions:
+#   - `severity`: "critical" (wake someone) or "warning" (next business day)
+#   - `summary`: one-line identifier for the alert — shown in notification titles
+#   - `description`: what the alert means + current value + how to diagnose
+#   - `runbook_url` (optional): link to the handling procedure (left as a
+#      placeholder; fill in once there's internal docs to point at)
+#
+# `for:` durations are tuned for prod traffic shape (low, bursty). Short
+# `for:` windows fire on transient blips; long `for:` windows miss real
+# incidents. Adjust after observing a week of normal operation.
+
+groups:
+  - name: a2e-shell-availability
+    interval: 30s
+    rules:
+      - alert: A2eShellDown
+        expr: up{job="a2e-shell"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell is not responding to /metrics scrape"
+          description: |
+            Prometheus has been unable to scrape a2e-shell for >1 minute.
+            Either the container is down, the port binding is broken, or
+            the app is wedged. Check `docker ps`, `docker logs a2e-shell`,
+            and `curl http://127.0.0.1:8090/healthz` on the host.
+          runbook_url: "https://github.com/MauricioPerera/a2e-shell/blob/main/docs/OPERATIONS.md#service-down"
+
+  - name: a2e-shell-errors
+    interval: 30s
+    rules:
+      # INTERNAL errors mean an uncaught exception slipped past all the
+      # handlers — a bug, not a user error. Any sustained rate is serious.
+      - alert: A2eShellInternalErrorsFiring
+        expr: sum(rate(a2e_errors_total{code="INTERNAL"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell is emitting INTERNAL errors"
+          description: |
+            INTERNAL error codes indicate an uncaught exception — a bug,
+            not a client-side misuse. Any sustained rate for 2 minutes
+            means users are hitting it right now.
+            Current rate: {{ $value | printf "%.3f" }} errors/sec over the last 5m.
+            Check `docker logs a2e-shell | grep http.error.unhandled`.
+
+      # Elevated overall error rate (any code) — noisy clients, broken
+      # integrations, or surface-level bugs.
+      - alert: A2eShellHighErrorRate
+        expr: |
+          (
+            sum(rate(a2e_errors_total[5m]))
+              /
+            sum(rate(a2e_http_requests_total[5m]))
+          ) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell error rate is >25% of requests"
+          description: |
+            >25% of all requests are returning an error code over the last 5m.
+            Current ratio: {{ $value | printf "%.2f" }}.
+            Break down by code in the overview dashboard "Errors by code"
+            panel to identify whether it's auth, parse, or upstream failures.
+
+  - name: a2e-shell-performance
+    interval: 30s
+    rules:
+      - alert: A2eShellP95LatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(a2e_exec_duration_ms_bucket[5m]))
+          ) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell exec p95 latency exceeds 1s"
+          description: |
+            p95 end-to-end exec duration has exceeded 1000ms for 5 minutes.
+            Current p95: {{ $value | printf "%.0f" }}ms.
+            Likely causes: upstream MCP server slowness, rate-limit queueing,
+            or CPU saturation. Cross-check with event-loop-lag and MCP
+            server response times.
+
+      - alert: A2eShellEventLoopLagHigh
+        expr: nodejs_eventloop_lag_seconds{job="a2e-shell"} > 0.2
+        for: 3m
+        labels:
+          severity: warning
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell event loop lag exceeds 200ms"
+          description: |
+            Node event loop lag is {{ $value | printf "%.3f" }}s (sustained >200ms
+            for 3m). The process is CPU-saturated or blocked on sync I/O —
+            new requests will queue. Check container CPU usage and look for
+            large synchronous operations (huge regex, JSON.parse of >10MB).
+
+      # Memory slowly climbing past 800MB over 10m is the classic leak signal.
+      # Adjust the threshold to match your deployment's baseline.
+      - alert: A2eShellHighMemory
+        expr: process_resident_memory_bytes{job="a2e-shell"} > 800 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell RSS exceeds 800 MiB"
+          description: |
+            Process resident memory has exceeded 800 MiB for 10 minutes.
+            Current: {{ $value | humanize1024 }}B.
+            Normal baseline is ~80-120 MiB (N sessions, modest catalog);
+            sustained 800 MiB+ typically means a binding leak (sessions
+            not being reaped) or a Buffer from /exec never released.
+
+  - name: a2e-shell-capacity
+    interval: 30s
+    rules:
+      - alert: A2eShellSessionsHigh
+        expr: a2e_sessions_active{job="a2e-shell"} > 500
+        for: 10m
+        labels:
+          severity: warning
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell active session count exceeds 500"
+          description: |
+            {{ $value | printf "%.0f" }} sessions alive for >10 minutes.
+            The manager's per-session memory (~1-10 MiB) means 500+ sessions
+            push RSS toward the gigabyte range. If this isn't expected
+            traffic, sessions are leaking — check TTL + explicit DELETE calls.
+
+      # Sustained rate-limit rejections suggest either a misbehaving client
+      # or a too-tight cap. Either way, worth a human look.
+      - alert: A2eShellRateLimitSustained
+        expr: sum(rate(a2e_rate_limit_hits_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+          service: a2e-shell
+        annotations:
+          summary: "a2e-shell rate limits are firing sustainedly"
+          description: |
+            >1 rate-limit rejection/sec sustained for 10 minutes.
+            Either a client is misbehaving (break down by bucket in the
+            "Rate limit hits" panel), or the cap is too tight for real
+            traffic. `a2e_rate_limit_hits_total` buckets identify which
+            limit (session vs per-MCP-server vs create).
