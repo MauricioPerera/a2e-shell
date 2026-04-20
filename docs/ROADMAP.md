@@ -177,11 +177,11 @@ Complete scope per RFC 001:
 
 ---
 
-## v1.2 — Bounded mode + MCP breadth
+## v1.2 — Bounded mode — **shipped (GA)**
 
-Additive scope on top of v1.1. No breaking changes to v1.1 surface.
+Additive scope on top of v1.1. No breaking changes to v1.1 surface. Tag: `v1.2.0`.
 
-### Bounded mode — **shipped (rc.1)**
+### Bounded mode — **shipped (rc.1 → GA)**
 
 - `GRAMMAR.ebnf` enforced at runtime. `mode: "bounded"` session rejects any command that doesn't parse against the grammar.
 - Parser emits canonical AST → validated → executed through a restricted interpreter (not bash).
@@ -199,17 +199,29 @@ Additive scope on top of v1.1. No breaking changes to v1.1 surface.
 - **Real `--parallel=N` in foreach**: `AsyncLocalStorage`-backed lexical frames for the iteration variable; bounded-concurrency worker pool. Iteration records ordered by index. First-error-wins under `--on-error=abort`. Concurrent `save` to the same name still races — users emit interpolated names for per-iteration accumulators.
 - **Multi-tokenizer benchmark**: `bench:bounded` runs both cl100k_base (GPT-3.5/4) and o200k_base (GPT-4o/5) and reports side-by-side ratios + per-trace drift. Empirical drift: 0.1–0.9pp per trace (0.3pp aggregate) → the token-cost win is NOT a cl100k artifact. Gate in `tests/integration/token-budget.test.ts` asserts ≤5pp per-trace, ≤3pp aggregate. Claude 3+ / Gemma / Llama tokenizers are not publicly shipped; the two OpenAI-family encoders we ship span the width of available public encoders.
 
-### Bounded mode — deferred to v1.3
+---
 
-- **SSE streaming for bounded**: JSON path is live; `Accept: text/event-stream` on bounded sessions still routes through the unrestricted code.
+## v1.3 — MCP breadth
 
-### MCP breadth (still pending)
+**Theme**: close the MCP gap that v1.1 left open. Spec: [`docs/rfcs/002-mcp-stdio-and-breadth.md`](rfcs/002-mcp-stdio-and-breadth.md).
 
-- **stdio transport for MCP servers**: spawn MCP server as a subprocess, pipe line-framed JSON-RPC. Enables local-only MCP servers without HTTP exposure. Subprocess lifecycle at session create/delete.
-- **Mcp-Session-Id threading**: for MCP servers that maintain state, thread the session id header across subsequent requests.
-- **Server-initiated notification stream**: long-lived GET to the MCP endpoint for notifications arriving outside in-flight requests (e.g. `notifications/resources/list_changed`).
+Additive on top of v1.2. No breaking changes to v1.1/v1.2 surface.
+
+### In scope (rc.1 target)
+
+- **stdio transport for MCP servers**: spawn the server as a subprocess, pipe line-framed JSON-RPC. Unlocks the majority of MCP servers in the wild (reference implementations, Postgres, filesystem, git — all ship stdio-only). Subprocess lifecycle at session create/delete: EOF → SIGTERM(2s) → SIGKILL(5s). Binary allowlist enforced. Crash → next `tools/call` returns `MCP_SERVER_UNREACHABLE`. No auto-restart in v1.3.
+- **`Mcp-Session-Id` threading**: for HTTP/SSE servers that maintain per-session state (OAuth, pagination cursors, cached auth), propagate the `Mcp-Session-Id` header across requests per MCP 2025-06-18 §2.1.4. Rotating ids honored. Logged as SHA-8 hash (never raw).
+- **Multi-server hardening**: 6+ concurrent servers per session, per-server rate limit (`mcp_per_server_rpm`, default 600/min), explicit keep-alive undici agent per (server id, session) with pool size 4. Load-test gate: p95 < 200ms overhead vs single-server.
+
+### Deferred from v1.2
+
+- **SSE streaming for bounded**: JSON path is live; `Accept: text/event-stream` on bounded sessions still routes through the unrestricted streaming code. Low priority (bounded responses are point-in-time canonical, not progressive); defer until concrete use case appears.
+
+### Deferred to v1.4
+
+- **Server-initiated notification stream**: long-lived GET for `notifications/resources/list_changed` etc. Pairs with `resources/subscribe`.
 - **resources/subscribe**: client-driven subscription to resource URIs; cache invalidation on `notifications/resources/updated`.
-- **Multi-server hardening**: load tests with 4+ MCP servers per session, per-server rate limiting, connection pooling.
+- **`command: "npm:@modelcontextprotocol/..."` sugar**: convenience wrapper that resolves via `npx`. Security footgun; defer until the threat model is nailed down.
 
 ---
 
