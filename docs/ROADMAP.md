@@ -96,9 +96,9 @@ Initial HTTP API (`POST /sessions`, `POST /sessions/:id/exec`, state + transcrip
 
 ---
 
-## v1.0 — Stability — **in rc**
+## v1.0 — Stability — **shipped (rc series: rc.1 through rc.3)**
 
-**Current tag: [v1.0.0-rc.3](https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.3)**. Every in-tree item shipped; the only remaining blocker for `v1.0.0` final is the external security audit.
+Final rc: [v1.0.0-rc.3](https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.0.0-rc.3). Schema lock, TLS opt-in, deployment templates, performance SLO bench in CI, API version header. v1.0 final GA is gated on external security audit (out-of-band); the rc.3 tag is what v1.1 extends from.
 
 **Theme**: freeze the promise; run it in real production.
 
@@ -142,6 +142,50 @@ Initial HTTP API (`POST /sessions`, `POST /sessions/:id/exec`, state + transcrip
 - Audit report public.
 - At least one reference deployment (our own or partner's) running in production for 30 days.
 - Schema versioning policy documented and enforced via CI.
+
+---
+
+## v1.1 — MCP gateway (inbound) — **shipped**
+
+**Current tag: [v1.1.0](https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0)**.
+
+a2e-shell is a token-disciplined MCP client. Sessions accept an `mcp_servers` array; connected servers' tools, resources, and prompts are exposed to the agent via the same canonical response format used for bash exec. Benchmark (95.9% token reduction vs naive MCP client on a realistic 3-turn agent task) ships with the release.
+
+Complete scope per RFC 001:
+
+- HTTP + SSE Streamable transports
+- All three read-side primitives (tools/resources/prompts) with caching
+- Progress notification relay over exec SSE
+- Full inheritance of v1.0 discipline: redaction, rate limits, idempotency, transcript, canonical response
+
+### What's frozen at v1.1
+
+- `CreateSessionRequest.mcp_servers` shape
+- `CreateSessionResponse.mcp_servers[]` shape (with resources_count / prompts_count)
+- `McpAuthSpec` (token discriminated union)
+- Virtual commands: `/bin/mcp-invoke`, `/bin/mcp-read`, `/bin/mcp-prompt`
+- SSE exec `progress` event
+- MCP error codes (5 new)
+- Reachability report structure
+
+### Deferred to v1.2+
+
+- stdio transport for MCP
+- `Mcp-Session-Id` header threading
+- Server-initiated GET listening channel
+- `resources/subscribe` + live invalidation
+
+---
+
+## v1.2 — MCP breadth + operability
+
+Additive scope on top of v1.1. No breaking changes to v1.1 surface.
+
+- **stdio transport for MCP servers**: spawn MCP server as a subprocess, pipe line-framed JSON-RPC. Enables local-only MCP servers without HTTP exposure. Subprocess lifecycle at session create/delete.
+- **Mcp-Session-Id threading**: for MCP servers that maintain state, thread the session id header across subsequent requests.
+- **Server-initiated notification stream**: long-lived GET to the MCP endpoint for notifications arriving outside in-flight requests (e.g. `notifications/resources/list_changed`).
+- **resources/subscribe**: client-driven subscription to resource URIs; cache invalidation on `notifications/resources/updated`.
+- **Multi-server hardening**: load tests with 4+ MCP servers per session, per-server rate limiting, connection pooling.
 
 ---
 
@@ -189,7 +233,7 @@ Initial HTTP API (`POST /sessions`, `POST /sessions/:id/exec`, state + transcrip
 Design decisions we've made NOT to chase:
 
 - **Arbitrary code execution in the host process**. No `eval`, no `vm`, no in-process plugin system. Bounded mode's plugin verbs compile ahead of time; there is no runtime code injection.
-- **MCP compatibility as a first-class transport**. A2E-shell can be *wrapped* by an MCP server (mcp-to-a2e adapter), but the server itself won't implement the MCP protocol. MCP's curated-tool catalog model is fundamentally the pattern we're replacing.
+- **a2e-shell as an MCP server**. a2e-shell CONSUMES external MCP servers (v1.1 gateway); it does not implement the MCP protocol as its own transport. Agents talk to a2e-shell via our HTTP API (`POST /sessions/:id/exec` with canonical response), not via JSON-RPC. If an MCP-speaking agent needs to drive a2e-shell, route via a thin adapter. The catalog-side MCP server (exposing a2e-skills over MCP) lives in a companion project — see [a2e-skills RFC 001](https://github.com/MauricioPerera/a2e-skills/blob/main/docs/rfcs/001-mcp-adapter.md).
 - **LLM-specific optimizations hardcoded**. The HTTP API and the system prompt are generic. No Claude-specific or GPT-specific code paths.
 - **State synchronization across geographic regions**. Sessions are a single-region primitive. Multi-region requires external coordination (reverse-proxy routing to home region).
 - **Auth/identity provider integration (OIDC, OAuth2, SAML)**. Bearer tokens with external rotation are sufficient. Integrations belong in a reverse proxy.

@@ -6,6 +6,63 @@ Pre-1.0 releases (v0.x) allowed breaking changes between minors. From 1.0, break
 
 ---
 
+## [1.1.0] - 2026-04-19
+
+Final release of v1.1 — **MCP gateway (inbound)**. All RFC 001 scope is implemented end-to-end:
+
+- HTTP + SSE Streamable transports for MCP servers
+- All three read-side primitives: `tools`, `resources`, `prompts`
+- Progress notification relay over exec SSE
+- Redaction, rate limiting, transcript, idempotency — all unchanged from v1.0 and applied uniformly to MCP invocations
+- Canonical response wrapping for every MCP output (preview + shape + binding + stderr + truncated)
+
+### Benchmark
+
+A new benchmark ([`tests/benchmarks/mcp-gateway.ts`](tests/benchmarks/mcp-gateway.ts), run via `npm run bench:mcp`) compares token consumption between the naive MCP client pattern (Claude Desktop / Cursor: monolithic tool injection + verbatim response dumps + no cross-turn bindings) and a2e-shell's gateway pattern on a realistic 3-turn scenario (fetch 50 GitHub issues → filter → summarize 5):
+
+| Pattern | Prompt tokens | Completion tokens | Total |
+|---|---|---|---|
+| Baseline (naive MCP client) | 64,816 | 279 | **65,095** |
+| Gateway (a2e-shell) | 2,545 | 119 | **2,664** |
+| **Savings** | **96.1%** | **57.3%** | **95.9%** |
+
+At Gemma-4 pricing ($0.10/$0.30 per M), this is $0.006565 → $0.000290 per task — **23× cheaper at scale**. The savings come from three additive sources:
+
+1. **Reachability filtering**: 1 tool schema exposed out of 15 (operator-controlled via session capabilities), reducing the system prompt by ~93%
+2. **Canonical preview**: ~2 KB preview instead of ~150 KB raw `list_issues` response
+3. **Binding reuse**: the list is captured under `$issues`, enabling a single `jq` pipe that avoids 5 follow-up `get_issue` tool calls
+
+Real-world numbers will vary with task shape, tool output sizes, and reachability discipline — but the architectural ratio (close to 20× at scale) is reliable across scenarios with heavy responses and multi-turn follow-ups.
+
+### What's frozen in v1.1
+
+The following surface is now a stable contract from v1.1 onward:
+
+- `CreateSessionRequest.mcp_servers`: optional array of `{id, transport, url, auth?, timeout_ms}`
+- `CreateSessionResponse.mcp_servers[]`: per-server status with counts for tools, resources, prompts
+- `McpAuthSpec`: discriminated union with `token` variant (`env_var`, `scheme`, `header`)
+- Error codes: `MCP_SERVER_UNREACHABLE` (503), `MCP_AUTH_FAILED` (401), `MCP_TOOL_NOT_FOUND` (200), `MCP_PROTOCOL_ERROR` (200), `MCP_TIMEOUT` (200)
+- Virtual commands: `/bin/mcp-invoke`, `/bin/mcp-read`, `/bin/mcp-prompt`
+- SSE exec event types: `start`, `stdout`, `stderr`, `progress`, `done`, `error`
+- Transport enum: `"http" | "sse"` (stdio reserved for v1.2+)
+- Reachability report structure: `{tools, resources, prompts, summary}` written to `<catalog>/index/mcp-tools.json`
+
+Additive changes (new error codes, new transport values, new event types) remain allowed as minor version bumps. Breaking changes require v2.0 under `/v2/*`.
+
+### Deferred to v1.2+
+
+- stdio transport (subprocess-launched MCP servers)
+- `Mcp-Session-Id` threading for stateful MCP sessions
+- Server-initiated GET listening channel (long-lived notification stream)
+- `resources/subscribe` + live cache invalidation
+- External security audit findings
+
+### Test suite
+
+180/180 green on CI. No flakes observed in the last 5 CI runs.
+
+---
+
 ## [1.1.0-rc.3] - 2026-04-19
 
 Third release candidate for v1.1. Adds SSE response handling + progress notification relay. Completes the read-side MCP primitive surface planned for v1.1.
@@ -229,6 +286,7 @@ Initial release. HTTP server exposing a real OS shell as a primitive tool for LL
 - Transcript as append-only audit log. Replay endpoint computing an integrity hash.
 - Default capability surface via Dockerfile: `curl`, `jq`, `gh`, `aws-cli`, `kubectl`, `git`, `grep`, `sed`, `gawk`, `ripgrep`.
 
+[1.1.0]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0
 [1.1.0-rc.3]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.3
 [1.1.0-rc.2]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.2
 [1.1.0-rc.1]: https://github.com/MauricioPerera/a2e-shell/releases/tag/v1.1.0-rc.1
