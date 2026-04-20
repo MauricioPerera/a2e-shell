@@ -16,7 +16,7 @@
     "lint": "eslint src tests --ext .ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:golden": "vitest run tests/golden.test.ts",
+    "test:golden": "vitest run tests/integration/golden.test.ts",
     "bench:tokens": "tsx tests/benchmarks/tokens.ts",
     "bench:http": "tsx tests/benchmarks/http.bench.ts",
     "bench:mcp": "tsx tests/benchmarks/mcp-gateway.ts"
@@ -34,6 +34,7 @@
     "@typescript-eslint/parser": "^8.7.0",
     "eslint": "^9.11.0",
     "gpt-tokenizer": "^3.4.0",
+    "peggy": "^5.1.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
