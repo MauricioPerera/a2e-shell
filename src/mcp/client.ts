@@ -384,6 +384,12 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
   const subscribedUris = new Set<string>();
   const dispatcher = buildCatalogDispatcher(spec.id, subscribedUris);
 
+  // Long-lived notification stream (RFC 004 phase 3). Owned by the client;
+  // aborted on close(). Status reflected in the HTTP session response so
+  // operators can see which servers feed live notifications.
+  const streamAbort = new AbortController();
+  let streamStatus: "connecting" | "connected" | "unsupported" | "disabled" = "connecting";
+
   // --- handshake -----------------------------------------------------------
 
   const initResult = await rpc<McpInitializeResult>("initialize", {
@@ -504,6 +510,41 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     })();
   }
 
+  // --- long-lived notification stream (RFC 004 phase 3) -------------------
+  // Fire-and-forget: a failing stream doesn't block the RPC channel. The
+  // loop tries up to 3 reconnects with exponential backoff (1s, 2s, 4s)
+  // after a successful connect drops, and gives up on non-retryable
+  // responses (404/405/401/403) after logging once.
+  void runNotificationStream({
+    spec,
+    authHeaders,
+    getSessionId: () => cachedSessionId,
+    onOpen: () => {
+      streamStatus = "connected";
+      logger.info({ event: "mcp.stream.connected", server_id: spec.id, transport: "http" });
+    },
+    onNotification: (method, params) => {
+      dispatcher.dispatch(method, params);
+    },
+    onUnsupported: () => {
+      streamStatus = "unsupported";
+      logger.info({ event: "mcp.stream.unsupported", server_id: spec.id });
+    },
+    onDisabled: (reason) => {
+      streamStatus = "disabled";
+      logger.info({ event: "mcp.stream.disabled", server_id: spec.id, reason });
+    },
+    onDisconnected: (reason, attempts) => {
+      logger.info({
+        event: "mcp.stream.disconnected",
+        server_id: spec.id,
+        reason,
+        attempts,
+      });
+    },
+    signal: streamAbort.signal,
+  });
+
   return {
     state,
     async callTool(name, args, opts) {
@@ -598,12 +639,138 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       return dispatcher.onCatalogEvent(listener);
     },
     close() {
-      // HTTP transport has no persistent connection yet (Phase 3 adds the
-      // long-lived GET). Tear down the catalog dispatcher so pending
-      // debounce timers don't leak.
+      // Abort the long-lived notification stream; no stray reconnects.
+      streamAbort.abort();
+      // Tear down the catalog dispatcher so pending debounce timers don't leak.
       dispatcher.shutdown();
     },
   };
+}
+
+// ============================================================================
+// runNotificationStream — long-lived GET for MCP server-initiated messages
+// ============================================================================
+
+const STREAM_BACKOFFS_MS = [1_000, 2_000, 4_000];
+
+interface RunNotificationStreamOpts {
+  readonly spec: McpServerSpecHttpT;
+  readonly authHeaders: Record<string, string>;
+  readonly getSessionId: () => string | null;
+  readonly onOpen: () => void;
+  readonly onNotification: (method: string, params: unknown) => void;
+  readonly onUnsupported: () => void;
+  readonly onDisabled: (reason: string) => void;
+  readonly onDisconnected: (reason: string, attempts: number) => void;
+  readonly signal: AbortSignal;
+}
+
+/**
+ * Open a long-lived `GET <spec.url>` with `Accept: text/event-stream`,
+ * parse events as JSON-RPC notifications, and hand them to `onNotification`.
+ *
+ * Retries up to 3 times with exponential backoff (1s, 2s, 4s) after a
+ * stream that previously reached `onOpen` drops. Gives up permanently on:
+ *   - 404 / 405 (server doesn't support server-initiated stream)
+ *   - 401 / 403 (auth refused; future retries won't fix it)
+ *
+ * Aborts cleanly when `signal` fires.
+ */
+async function runNotificationStream(opts: RunNotificationStreamOpts): Promise<void> {
+  let attempt = 0;
+  let everConnected = false;
+  while (!opts.signal.aborted) {
+    let res: Response;
+    try {
+      const headers: Record<string, string> = {
+        accept: "text/event-stream",
+        ...opts.authHeaders,
+      };
+      const sid = opts.getSessionId();
+      if (sid !== null) headers["Mcp-Session-Id"] = sid;
+      res = await fetch(opts.spec.url, {
+        method: "GET",
+        headers,
+        signal: opts.signal,
+      });
+    } catch (e) {
+      if (opts.signal.aborted) return;
+      // Network-level failure. If we've been connected once, retry; else
+      // treat as unreachable and bail out (don't spam reconnects on servers
+      // that never had a stream to begin with).
+      if (!everConnected) {
+        opts.onDisconnected(`network: ${(e as Error).message}`, attempt);
+        return;
+      }
+      if (!(await backoffOrGiveUp(opts, attempt++))) return;
+      continue;
+    }
+
+    if (res.status === 404 || res.status === 405) {
+      opts.onUnsupported();
+      return;
+    }
+    if (res.status === 401 || res.status === 403) {
+      opts.onDisabled(`http_${res.status}`);
+      return;
+    }
+    if (!res.ok || !res.body) {
+      if (!everConnected) {
+        opts.onDisconnected(`http_${res.status}`, attempt);
+        return;
+      }
+      if (!(await backoffOrGiveUp(opts, attempt++))) return;
+      continue;
+    }
+
+    everConnected = true;
+    attempt = 0; // reset backoff on a successful open
+    opts.onOpen();
+    try {
+      for await (const message of parseSseStream(res.body)) {
+        if (!isJsonRpcResponse(message)) continue;
+        const m = message as { id?: number | string; method?: string; params?: unknown };
+        if (m.id === undefined && typeof m.method === "string") {
+          opts.onNotification(m.method, m.params);
+        }
+      }
+      // Stream closed cleanly. If not aborted, try to reconnect.
+      if (!opts.signal.aborted) {
+        if (!(await backoffOrGiveUp(opts, attempt++))) return;
+      }
+    } catch (e) {
+      if (opts.signal.aborted) return;
+      opts.onDisconnected(`stream_error: ${(e as Error).message}`, attempt);
+      if (!(await backoffOrGiveUp(opts, attempt++))) return;
+    }
+  }
+}
+
+/**
+ * Sleep for the next backoff step; return false once we've exhausted the
+ * ladder so the caller bails out.
+ */
+async function backoffOrGiveUp(
+  opts: RunNotificationStreamOpts,
+  attempt: number,
+): Promise<boolean> {
+  if (attempt >= STREAM_BACKOFFS_MS.length) {
+    opts.onDisconnected("exhausted_backoff", attempt);
+    return false;
+  }
+  const delay = STREAM_BACKOFFS_MS[attempt]!;
+  await new Promise<void>((resolve) => {
+    const t = setTimeout(() => {
+      opts.signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delay);
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve();
+    };
+    opts.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return !opts.signal.aborted;
 }
 
 /**
