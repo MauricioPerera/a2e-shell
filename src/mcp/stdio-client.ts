@@ -67,6 +67,12 @@ export interface ConnectStdioOptions {
    * null means spawn `spec.command` directly (absolute path case).
    */
   resolvedCommand?: string;
+  /**
+   * Args to prepend before `spec.args` in the final argv. Used by the
+   * `npm:` sugar resolver (RFC 003) to slip in `-y <pkg>@<ver>` ahead of
+   * user-supplied args. Empty or undefined means "use spec.args verbatim".
+   */
+  prependArgs?: readonly string[];
 }
 
 /**
@@ -80,6 +86,9 @@ export async function connectStdioMcpServer(
 ): Promise<McpClient> {
   const { spec, redactor } = opts;
   const cmd = opts.resolvedCommand ?? spec.command;
+  const argv = opts.prependArgs && opts.prependArgs.length > 0
+    ? [...opts.prependArgs, ...spec.args]
+    : spec.args;
 
   // --- per-connection mutable state ----------------------------------------
 
@@ -117,7 +126,7 @@ export async function connectStdioMcpServer(
     };
     if (spec.cwd) spawnOpts.cwd = spec.cwd;
 
-    child = spawn(cmd, spec.args, spawnOpts) as ChildProcessWithoutNullStreams;
+    child = spawn(cmd, argv, spawnOpts) as ChildProcessWithoutNullStreams;
   } catch (e) {
     throw new A2EError(
       "MCP_SERVER_UNREACHABLE",

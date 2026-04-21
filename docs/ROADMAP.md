@@ -221,8 +221,22 @@ Additive on top of v1.2. No breaking changes to v1.1/v1.2 surface.
 
 - **Server-initiated notification stream**: long-lived GET for `notifications/resources/list_changed` etc. Pairs with `resources/subscribe`.
 - **resources/subscribe**: client-driven subscription to resource URIs; cache invalidation on `notifications/resources/updated`.
-- **`command: "npm:@modelcontextprotocol/..."` sugar**: convenience wrapper that resolves via `npx`. Security footgun; defer until the threat model is nailed down.
 - **Explicit undici Agent with pool size cap**: Node's default undici behavior already provides keep-alive and is sufficient per the v1.3 load test. Revisit only if production numbers regress.
+
+---
+
+## v1.4 — MCP ergonomics — **in progress**
+
+Additive on top of v1.3. No breaking changes to v1.1 / v1.2 / v1.3 surface.
+
+### Shipped
+
+- **`npm:<pkg>@<ver>` command sugar for stdio MCP servers** (RFC 003). `command: "npm:@modelcontextprotocol/server-filesystem@1.2.3"` expands to `npx -y <pkg>@<ver>` at connect time. Strict grammar: exact semver only (no tags, no ranges). `npx` must be in `binaries_allowlist` — otherwise `CAPABILITY_DENIED`. Threat model covered in RFC 003 §Threat model.
+
+### Deferred (carry-overs from v1.3)
+
+- **Server-initiated notification stream** + **resources/subscribe** (paired).
+- **Explicit undici Agent with pool size cap**.
 
 ---
 

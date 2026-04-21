@@ -103,10 +103,15 @@ Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`,
         timeout_ms?: number,            //   default 30_000
         rate_limit_rpm?: number         //   v1.3; default 600; 0 = disabled
       }
-    | {                                 //   stdio transport (v1.3)
+    | {                                 //   stdio transport (v1.3 + v1.4)
         id: string,
         transport: "stdio",
-        command: string,                //   absolute path or bare name (allowlist-checked)
+        command: string,                //   three shapes:
+                                        //   1. absolute path
+                                        //   2. bare name (allowlist-checked)
+                                        //   3. "npm:<pkg>@<x.y.z>" sugar (v1.4, RFC 003)
+                                        //      requires 'npx' in binaries_allowlist;
+                                        //      expands to npx -y pkg@ver before spawn
         args?: string[],
         env?: Record<string, string>,   //   overlay on process env
         cwd?: string,
