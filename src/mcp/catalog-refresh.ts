@@ -86,6 +86,30 @@ export function serverSupportsSubscribe(init: McpInitializeResult): boolean {
 }
 
 /**
+ * True iff the server advertises ANY notification-producing capability
+ * (subscribe, tools.listChanged, resources.listChanged, prompts.listChanged).
+ * Used by the HTTP client to decide whether to open the long-lived GET
+ * stream. Servers that won't emit notifications get no stream — avoids
+ * pointless GET traffic against POST-only JSON-RPC servers.
+ */
+export function serverMayEmitNotifications(init: McpInitializeResult): boolean {
+  const caps = init.capabilities as
+    | {
+        resources?: { subscribe?: unknown; listChanged?: unknown };
+        tools?: { listChanged?: unknown };
+        prompts?: { listChanged?: unknown };
+      }
+    | undefined;
+  if (!caps) return false;
+  return (
+    caps.resources?.subscribe === true
+    || caps.resources?.listChanged === true
+    || caps.tools?.listChanged === true
+    || caps.prompts?.listChanged === true
+  );
+}
+
+/**
  * Auto-subscribe every URI currently in `resources` (sequential). Caps at
  * AUTO_SUBSCRIBE_CAP to bound the subscribe-set size per RFC 004 §T6.
  * Returns the count actually subscribed. Failures per-URI are logged at

@@ -101,7 +101,8 @@ Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`,
         url: string,                    //   absolute; CF/proxy-fronted OK
         auth?: { type: "token", env_var: string, scheme?: string, header?: string },
         timeout_ms?: number,            //   default 30_000
-        rate_limit_rpm?: number         //   v1.3; default 600; 0 = disabled
+        rate_limit_rpm?: number,        //   v1.3; default 600; 0 = disabled
+        resources_subscribe?: boolean   //   v1.4, RFC 004; default true
       }
     | {                                 //   stdio transport (v1.3 + v1.4)
         id: string,
@@ -116,7 +117,8 @@ Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`,
         env?: Record<string, string>,   //   overlay on process env
         cwd?: string,
         timeout_ms?: number,
-        rate_limit_rpm?: number
+        rate_limit_rpm?: number,
+        resources_subscribe?: boolean   //   v1.4, RFC 004; default true
       }
   >                                     //   max 8 servers per session
 }
@@ -145,14 +147,20 @@ Some codes (`TIMEOUT`, `SIZE_LIMIT`, `UPSTREAM_ERROR`, `INTERPOLATION_REJECTED`,
     },
     mirror_path: string | null          // null in direct-clone mode
   },
-  mcp_servers: Array<{                  // v1.1 + v1.3; [] if no servers requested
+  mcp_servers: Array<{                  // v1.1 + v1.3 + v1.4
     id: string,
     url: string,                        // HTTP url for http/sse, "stdio://<command>" for stdio
-    protocol_version: string,           // e.g. "2025-06-18"
+    protocol_version: string,
     tools_count: number,
     resources_count: number,
     prompts_count: number,
-    server_info: { name: string, version: string } | null
+    server_info: { name: string, version: string } | null,
+    notifications_stream:               // v1.4, RFC 004 phase 3
+        "connecting"                    //   HTTP GET still opening (transient)
+      | "connected"                     //   live stream; list_changed flows
+      | "unsupported"                   //   server answered 404/405 on GET
+      | "disabled"                      //   auth refused or subprocess exited
+      | "unavailable"                   //   transport has no stream channel
   }>
 }
 ```

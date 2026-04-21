@@ -44,8 +44,10 @@ import {
 import {
   autoSubscribeKnownResources,
   installCatalogRefresher,
+  serverMayEmitNotifications,
   serverSupportsSubscribe,
 } from "./catalog-refresh.js";
+import { mcpStreamConnected, mcpStreamReconnects } from "../metrics/metrics.js";
 
 const PROTOCOL_VERSION = "2025-06-18";
 const CLIENT_NAME = "a2e-shell";
@@ -93,6 +95,13 @@ export interface McpClient {
    * Debounced at 500ms per kind to bound refresh load.
    */
   onCatalogEvent(listener: import("./catalog-dispatcher.js").CatalogEventListener): () => void;
+  /**
+   * Live status of the server-initiated notification channel (RFC 004 phase 3).
+   * Read at response time; changes as the client connects, loses, or gives up.
+   * stdio transports always return "connected" while the subprocess is alive
+   * (notifications travel through the same pipe as responses).
+   */
+  notificationsStream(): "connecting" | "connected" | "unsupported" | "disabled" | "unavailable";
   close(): void;
 }
 
@@ -388,7 +397,7 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
   // aborted on close(). Status reflected in the HTTP session response so
   // operators can see which servers feed live notifications.
   const streamAbort = new AbortController();
-  let streamStatus: "connecting" | "connected" | "unsupported" | "disabled" = "connecting";
+  let streamStatus: "connecting" | "connected" | "unsupported" | "disabled" | "unavailable" = "connecting";
 
   // --- handshake -----------------------------------------------------------
 
@@ -511,16 +520,23 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
   }
 
   // --- long-lived notification stream (RFC 004 phase 3) -------------------
-  // Fire-and-forget: a failing stream doesn't block the RPC channel. The
-  // loop tries up to 3 reconnects with exponential backoff (1s, 2s, 4s)
-  // after a successful connect drops, and gives up on non-retryable
-  // responses (404/405/401/403) after logging once.
-  void runNotificationStream({
+  // Only open if the server advertises at least one notification-producing
+  // capability. Servers that are POST-only JSON-RPC get no stream, avoiding
+  // pointless GETs that would 405/400.
+  if (!serverMayEmitNotifications(initResult)) {
+    streamStatus = "unavailable";
+  } else {
+    // Fire-and-forget: a failing stream doesn't block the RPC channel. The
+    // loop tries up to 3 reconnects with exponential backoff (1s, 2s, 4s)
+    // after a successful connect drops, and gives up on non-retryable
+    // responses (404/405/401/403) after logging once.
+    void runNotificationStream({
     spec,
     authHeaders,
     getSessionId: () => cachedSessionId,
     onOpen: () => {
       streamStatus = "connected";
+      mcpStreamConnected.set({ server_id: spec.id }, 1);
       logger.info({ event: "mcp.stream.connected", server_id: spec.id, transport: "http" });
     },
     onNotification: (method, params) => {
@@ -528,13 +544,18 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     },
     onUnsupported: () => {
       streamStatus = "unsupported";
+      mcpStreamConnected.set({ server_id: spec.id }, 0);
       logger.info({ event: "mcp.stream.unsupported", server_id: spec.id });
     },
     onDisabled: (reason) => {
       streamStatus = "disabled";
+      mcpStreamConnected.set({ server_id: spec.id }, 0);
       logger.info({ event: "mcp.stream.disabled", server_id: spec.id, reason });
     },
     onDisconnected: (reason, attempts) => {
+      streamStatus = "disabled";
+      mcpStreamConnected.set({ server_id: spec.id }, 0);
+      if (attempts > 0) mcpStreamReconnects.inc({ server_id: spec.id }, attempts);
       logger.info({
         event: "mcp.stream.disconnected",
         server_id: spec.id,
@@ -542,8 +563,9 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
         attempts,
       });
     },
-    signal: streamAbort.signal,
-  });
+      signal: streamAbort.signal,
+    });
+  }
 
   return {
     state,
@@ -637,6 +659,9 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
     },
     onCatalogEvent(listener: CatalogEventListener) {
       return dispatcher.onCatalogEvent(listener);
+    },
+    notificationsStream() {
+      return streamStatus;
     },
     close() {
       // Abort the long-lived notification stream; no stray reconnects.

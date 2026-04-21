@@ -114,6 +114,20 @@ export const McpServerInfo = z
       })
       .passthrough()
       .nullable(),
+    /**
+     * RFC 004 (v1.4). Live status of the server-initiated notification
+     * channel for this server:
+     *   - "connecting"  HTTP GET stream still opening at response time
+     *                   (transient; check again later or ignore)
+     *   - "connected"   long-lived stream open; list_changed flows
+     *   - "unsupported" server answered 404/405 on the GET; static catalog
+     *   - "disabled"    auth refused (401/403) or subprocess exited;
+     *                   static catalog
+     *   - "unavailable" transport has no stream path
+     */
+    notifications_stream: z
+      .enum(["connecting", "connected", "unsupported", "disabled", "unavailable"])
+      .default("unavailable"),
   })
   .strict();
 export type McpServerInfo = z.infer<typeof McpServerInfo>;

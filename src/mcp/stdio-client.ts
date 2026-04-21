@@ -590,6 +590,12 @@ export async function connectStdioMcpServer(
     onCatalogEvent(listener: CatalogEventListener) {
       return dispatcher.onCatalogEvent(listener);
     },
+    notificationsStream() {
+      // stdio uses the same pipe for responses and notifications. As long
+      // as the subprocess is alive, notifications can flow. Report
+      // "connected" until the child exits; after exit, report "disabled".
+      return childExited ? "disabled" : "connected";
+    },
     close() {
       dispatcher.shutdown();
       close();

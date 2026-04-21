@@ -94,3 +94,26 @@ export const transcriptRotations = new Counter({
   help: "Transcript segment rotations (sessions reaching the soft cap).",
   registers: [registry],
 });
+
+// --- MCP notifications (RFC 004, v1.4) --------------------------------------
+
+export const mcpNotifications = new Counter({
+  name: "a2e_mcp_notifications_total",
+  help: "Server-initiated MCP notifications received by the catalog dispatcher.",
+  labelNames: ["server_id", "event"] as const,
+  registers: [registry],
+});
+
+export const mcpStreamReconnects = new Counter({
+  name: "a2e_mcp_stream_reconnects_total",
+  help: "Long-lived GET notification stream reconnect attempts by server.",
+  labelNames: ["server_id"] as const,
+  registers: [registry],
+});
+
+export const mcpStreamConnected = new Gauge({
+  name: "a2e_mcp_stream_connected",
+  help: "1 while the long-lived GET notification stream is open for this server, 0 otherwise.",
+  labelNames: ["server_id"] as const,
+  registers: [registry],
+});

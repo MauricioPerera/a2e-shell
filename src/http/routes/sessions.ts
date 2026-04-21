@@ -48,6 +48,7 @@ function buildCreateResponse(session: Session): CreateSessionResponse {
       resources_count: client.state.resources.size,
       prompts_count: client.state.prompts.size,
       server_info: null,
+      notifications_stream: client.notificationsStream(),
     });
   }
   return {

@@ -26,6 +26,7 @@
  */
 
 import { logger } from "../logging/logger.js";
+import { mcpNotifications } from "../metrics/metrics.js";
 
 const DEBOUNCE_MS = 500;
 
@@ -96,15 +97,19 @@ export function buildCatalogDispatcher(
       if (closed) return false;
       switch (method) {
         case "notifications/tools/list_changed":
+          mcpNotifications.inc({ server_id: serverId, event: "tools_list_changed" });
           scheduleDebounced("tools/list_changed");
           return true;
         case "notifications/resources/list_changed":
+          mcpNotifications.inc({ server_id: serverId, event: "resources_list_changed" });
           scheduleDebounced("resources/list_changed");
           return true;
         case "notifications/prompts/list_changed":
+          mcpNotifications.inc({ server_id: serverId, event: "prompts_list_changed" });
           scheduleDebounced("prompts/list_changed");
           return true;
         case "notifications/resources/updated": {
+          mcpNotifications.inc({ server_id: serverId, event: "resources_updated" });
           const uri = (params as { uri?: unknown } | null)?.uri;
           if (typeof uri !== "string") {
             logger.debug({

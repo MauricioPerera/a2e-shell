@@ -219,8 +219,6 @@ Additive on top of v1.2. No breaking changes to v1.1/v1.2 surface.
 
 ### Deferred to v1.4
 
-- **Server-initiated notification stream**: long-lived GET for `notifications/resources/list_changed` etc. Pairs with `resources/subscribe`.
-- **resources/subscribe**: client-driven subscription to resource URIs; cache invalidation on `notifications/resources/updated`.
 - **Explicit undici Agent with pool size cap**: Node's default undici behavior already provides keep-alive and is sufficient per the v1.3 load test. Revisit only if production numbers regress.
 
 ---
@@ -232,10 +230,10 @@ Additive on top of v1.3. No breaking changes to v1.1 / v1.2 / v1.3 surface.
 ### Shipped
 
 - **`npm:<pkg>@<ver>` command sugar for stdio MCP servers** (RFC 003). `command: "npm:@modelcontextprotocol/server-filesystem@1.2.3"` expands to `npx -y <pkg>@<ver>` at connect time. Strict grammar: exact semver only (no tags, no ranges). `npx` must be in `binaries_allowlist` — otherwise `CAPABILITY_DENIED`. Threat model covered in RFC 003 §Threat model.
+- **Server-initiated notification stream + auto-subscribe** (RFC 004). Both transports react to `notifications/{tools,resources,prompts}/list_changed` with atomic catalog refresh; both handle `notifications/resources/updated` for auto-subscribed URIs (capped at 512 per server). HTTP transport opens a long-lived `GET <url>` alongside the POST channel with backoff 1s/2s/4s on drops after a successful connect; degrades gracefully on 404/405 (`unsupported`) or 401/403 (`disabled`). `POST /sessions` response gains `notifications_stream` per server. Prometheus: `a2e_mcp_notifications_total`, `a2e_mcp_stream_reconnects_total`, `a2e_mcp_stream_connected`. Auto-subscribe default on; opt-out via `resources_subscribe: false` in the server spec. Agent-facing subscribe surface deferred to v1.5.
 
 ### Deferred (carry-overs from v1.3)
 
-- **Server-initiated notification stream** + **resources/subscribe** (paired).
 - **Explicit undici Agent with pool size cap**.
 
 ---
