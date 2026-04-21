@@ -47,6 +47,10 @@ import type {
   McpCallToolOptions,
   McpNotificationListener,
 } from "./client.js";
+import {
+  buildCatalogDispatcher,
+  type CatalogEventListener,
+} from "./catalog-dispatcher.js";
 
 const PROTOCOL_VERSION = "2025-06-18";
 const CLIENT_NAME = "a2e-shell";
@@ -91,6 +95,11 @@ export async function connectStdioMcpServer(
     : spec.args;
 
   // --- per-connection mutable state ----------------------------------------
+
+  // Catalog-event dispatcher (RFC 004). `subscribedUris` is a live reference
+  // read by the dispatcher on each resources/updated to decide emit-vs-drop.
+  const subscribedUris = new Set<string>();
+  const dispatcher = buildCatalogDispatcher(spec.id, subscribedUris);
 
   let nextRequestId = 1;
   const rateLimiter: RateLimiter = buildRateLimiter(spec.id, spec.rate_limit_rpm);
@@ -245,11 +254,14 @@ export async function connectStdioMcpServer(
     if (typeof msg !== "object" || msg === null) return;
     const m = msg as { id?: number | string; method?: string; params?: unknown };
 
-    // Notification (no id) → forward to any in-flight listener.
+    // Notification (no id) → dispatch to catalog handler first; if it
+    // doesn't claim it (not a catalog event), forward to in-flight listeners.
     if (m.id === undefined && typeof m.method === "string") {
-      // Notifications aren't per-request in JSON-RPC, but in MCP the server
-      // typically emits progress notifications during an in-flight call.
-      // Forward to all pending listeners; the wrong-listener case is benign.
+      const claimed = dispatcher.dispatch(m.method, m.params);
+      if (claimed) return;
+      // Fall back to in-flight listeners (progress/message etc.). MCP ties
+      // these to a request id via _meta, but stdio delivers them as bare
+      // notifications so we fan out. Wrong-listener case is benign.
       for (const p of pending.values()) {
         p.onNotification?.({ method: m.method, params: m.params });
       }
@@ -503,7 +515,43 @@ export async function connectStdioMcpServer(
       }
       return result;
     },
-    close,
+    async subscribeResource(uri) {
+      if (subscribedUris.has(uri)) return true;
+      try {
+        await rpc("resources/subscribe", { uri });
+        subscribedUris.add(uri);
+        return true;
+      } catch (e) {
+        if (isMethodNotFound(e)) {
+          logger.info({
+            event: "mcp.subscribe.unsupported",
+            server_id: spec.id,
+          });
+          return false;
+        }
+        throw e;
+      }
+    },
+    async unsubscribeResource(uri) {
+      if (!subscribedUris.has(uri)) return;
+      subscribedUris.delete(uri);
+      try {
+        await rpc("resources/unsubscribe", { uri });
+      } catch (e) {
+        logger.debug({
+          event: "mcp.unsubscribe.wire_error",
+          server_id: spec.id,
+          err: (e as Error).message,
+        });
+      }
+    },
+    onCatalogEvent(listener: CatalogEventListener) {
+      return dispatcher.onCatalogEvent(listener);
+    },
+    close() {
+      dispatcher.shutdown();
+      close();
+    },
   };
 }
 

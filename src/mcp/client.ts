@@ -37,6 +37,10 @@ import type {
   McpServerState,
   McpTool,
 } from "./types.js";
+import {
+  buildCatalogDispatcher,
+  type CatalogEventListener,
+} from "./catalog-dispatcher.js";
 
 const PROTOCOL_VERSION = "2025-06-18";
 const CLIENT_NAME = "a2e-shell";
@@ -65,6 +69,25 @@ export interface McpClient {
   ): Promise<McpCallToolResult>;
   readResource(uri: string): Promise<readonly McpResourceContents[]>;
   getPrompt(name: string, args: Record<string, unknown>): Promise<McpGetPromptResult>;
+  /**
+   * Subscribe to resource-update notifications for `uri` (RFC 004, v1.4).
+   * Idempotent. Returns true on wire success, false if the server lacks
+   * the `resources.subscribe` capability. Rejects with A2EError on protocol
+   * error. Internal API — not exposed through any agent-facing verb in v1.4.
+   */
+  subscribeResource(uri: string): Promise<boolean>;
+  /** Unsubscribe. Idempotent. Errors on the wire are swallowed at debug. */
+  unsubscribeResource(uri: string): Promise<void>;
+  /**
+   * Register a listener for catalog-level events (RFC 004, v1.4). Returns
+   * an unsubscribe fn. Events:
+   *   - `tools/list_changed`
+   *   - `resources/list_changed`
+   *   - `prompts/list_changed`
+   *   - `resources/updated` (only for subscribed URIs)
+   * Debounced at 500ms per kind to bound refresh load.
+   */
+  onCatalogEvent(listener: import("./catalog-dispatcher.js").CatalogEventListener): () => void;
   close(): void;
 }
 
@@ -326,9 +349,13 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       const m = message as { id?: number | string; method?: string; params?: unknown };
       // Matching response
       if (m.id !== undefined && m.id === expectedId) return message;
-      // Notification (no id, has method) — forward
+      // Notification (no id, has method) — dispatch, then forward.
+      // Catalog events (tools/list_changed, resources/updated, etc.) are
+      // claimed by the dispatcher; per-request listeners only see leftover
+      // notifications (typically progress/message during tools/call).
       if (m.id === undefined && typeof m.method === "string") {
-        if (onNotification) {
+        const claimed = dispatcher.dispatch(m.method, m.params);
+        if (!claimed && onNotification) {
           try {
             onNotification({ method: m.method, params: m.params });
           } catch {
@@ -343,6 +370,14 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       `mcp '${spec.id}' SSE stream closed without response for id ${expectedId}`,
     );
   }
+
+  // --- catalog-event dispatcher (RFC 004, v1.4) ---------------------------
+  // Built before handshake because SSE responses during handshake may
+  // carry catalog notifications. `subscribedUris` is a live reference —
+  // the dispatcher reads it on each resources/updated notification to
+  // decide whether to emit or drop.
+  const subscribedUris = new Set<string>();
+  const dispatcher = buildCatalogDispatcher(spec.id, subscribedUris);
 
   // --- handshake -----------------------------------------------------------
 
@@ -485,9 +520,44 @@ export async function connectMcpServer(opts: ConnectOptions): Promise<McpClient>
       }
       return result;
     },
+    async subscribeResource(uri) {
+      if (subscribedUris.has(uri)) return true;
+      try {
+        await rpc("resources/subscribe", { uri });
+        subscribedUris.add(uri);
+        return true;
+      } catch (e) {
+        if (isMethodNotFound(e)) {
+          logger.info({
+            event: "mcp.subscribe.unsupported",
+            server_id: spec.id,
+          });
+          return false;
+        }
+        throw e;
+      }
+    },
+    async unsubscribeResource(uri) {
+      if (!subscribedUris.has(uri)) return;
+      subscribedUris.delete(uri);
+      try {
+        await rpc("resources/unsubscribe", { uri });
+      } catch (e) {
+        logger.debug({
+          event: "mcp.unsubscribe.wire_error",
+          server_id: spec.id,
+          err: (e as Error).message,
+        });
+      }
+    },
+    onCatalogEvent(listener: CatalogEventListener) {
+      return dispatcher.onCatalogEvent(listener);
+    },
     close() {
-      // No persistent connection in HTTP transport. Placeholder for
-      // symmetry with future SSE/stdio clients.
+      // HTTP transport has no persistent connection yet (Phase 3 adds the
+      // long-lived GET). Tear down the catalog dispatcher so pending
+      // debounce timers don't leak.
+      dispatcher.shutdown();
     },
   };
 }

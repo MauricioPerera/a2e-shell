@@ -61,6 +61,14 @@ const McpServerSpecHttp = z
      * MCP server's own rate budget.
      */
     rate_limit_rpm: z.number().int().min(0).max(60_000).default(600),
+    /**
+     * Auto-subscribe to every resource the server publishes (v1.4, RFC 004).
+     * On by default — when the server advertises `capabilities.resources.subscribe`
+     * at initialize, the client issues `resources/subscribe` for each known
+     * URI (capped at 512). Set to `false` to skip the extra round-trips; the
+     * agent will still see `list_changed`-triggered refreshes.
+     */
+    resources_subscribe: z.boolean().default(true),
   })
   .strict();
 
@@ -96,6 +104,11 @@ const McpServerSpecStdio = z
      * clients can still OOM a subprocess with enough concurrent calls.
      */
     rate_limit_rpm: z.number().int().min(0).max(60_000).default(600),
+    /**
+     * Auto-subscribe to every resource the server publishes (v1.4, RFC 004).
+     * See http/sse branch for semantics.
+     */
+    resources_subscribe: z.boolean().default(true),
   })
   .strict();
 
