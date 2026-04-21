@@ -21,14 +21,37 @@
  *     simulates a mid-session subprocess death — the client connects fine,
  *     then the next RPC hits the void.
  *   - argv[2] === "garbage" → emit a non-JSON line right after initialize
+ *   - argv[2] === "notify"  → initialize advertises resources.subscribe = true;
+ *     handles resources/subscribe + resources/unsubscribe; the server emits
+ *     notifications on a timed schedule defined via env var:
+ *       A2E_TEST_NOTIFY_SCHEDULE="<ms>:<cmd>,<ms>:<cmd>,..."
+ *     Supported <cmd>:
+ *       list_changed tools      -> tools/list gains a 2nd tool
+ *       list_changed resources  -> resources/list gains a 2nd resource
+ *       list_changed prompts    -> prompts/list gains a 2nd prompt
+ *       updated <uri>           -> resources/updated for uri
+ *     Notifications are sent after the handshake completes (timers start
+ *     from the first "initialize" request).
  */
 
 import { createInterface } from "node:readline";
 
 const mode = process.argv[2] ?? "normal";
 
+// Mutable catalog for "notify" mode so list_changed can be demonstrated.
+let toolsExpanded = false;
+let resourcesExpanded = false;
+let promptsExpanded = false;
+const subscribed = new Set();
+
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+function notify(method, params) {
+  const body = { jsonrpc: "2.0", method };
+  if (params !== undefined) body.params = params;
+  send(body);
 }
 
 function respond(id, result) {
@@ -54,14 +77,57 @@ rl.on("line", (line) => {
   handle(req);
 });
 
+/**
+ * Parse A2E_TEST_NOTIFY_SCHEDULE once at startup and arm setTimeout for each
+ * entry. Cleared automatically if the process exits first.
+ */
+function armNotifySchedule() {
+  if (mode !== "notify") return;
+  const schedule = process.env.A2E_TEST_NOTIFY_SCHEDULE ?? "";
+  if (!schedule.trim()) return;
+  for (const entry of schedule.split(",")) {
+    const [msStr, ...cmdParts] = entry.split(":");
+    const ms = parseInt(msStr ?? "", 10);
+    const cmd = cmdParts.join(":").trim();
+    if (!Number.isFinite(ms) || ms < 0 || !cmd) continue;
+    setTimeout(() => fireCommand(cmd), ms).unref();
+  }
+}
+
+function fireCommand(cmd) {
+  if (cmd === "list_changed tools") {
+    toolsExpanded = true;
+    notify("notifications/tools/list_changed");
+  } else if (cmd === "list_changed resources") {
+    resourcesExpanded = true;
+    notify("notifications/resources/list_changed");
+  } else if (cmd === "list_changed prompts") {
+    promptsExpanded = true;
+    notify("notifications/prompts/list_changed");
+  } else if (cmd.startsWith("updated ")) {
+    const uri = cmd.slice("updated ".length).trim();
+    notify("notifications/resources/updated", { uri });
+  } else {
+    process.stderr.write(`[test-stdio-server] unknown schedule cmd: ${cmd}\n`);
+  }
+}
+
+armNotifySchedule();
+
 function handle(req) {
   const { id, method, params } = req;
   switch (method) {
     case "initialize": {
+      const capabilities = { tools: {}, resources: {}, prompts: {} };
+      if (mode === "notify") {
+        capabilities.resources = { subscribe: true, listChanged: true };
+        capabilities.tools = { listChanged: true };
+        capabilities.prompts = { listChanged: true };
+      }
       respond(id, {
         protocolVersion: "2025-06-18",
         serverInfo: { name: "test-stdio-server", version: "0.0.0" },
-        capabilities: { tools: {}, resources: {}, prompts: {} },
+        capabilities,
       });
       if (mode === "garbage") {
         process.stdout.write("this is not valid json\n");
@@ -72,19 +138,25 @@ function handle(req) {
       // No response required for notifications.
       return;
     case "tools/list": {
-      respond(id, {
-        tools: [
-          {
-            name: "echo",
-            description: "Echo back the input message",
-            inputSchema: {
-              type: "object",
-              properties: { message: { type: "string" } },
-              required: ["message"],
-            },
+      const tools = [
+        {
+          name: "echo",
+          description: "Echo back the input message",
+          inputSchema: {
+            type: "object",
+            properties: { message: { type: "string" } },
+            required: ["message"],
           },
-        ],
-      });
+        },
+      ];
+      if (toolsExpanded) {
+        tools.push({
+          name: "shout",
+          description: "Uppercase variant",
+          inputSchema: { type: "object", properties: { message: { type: "string" } } },
+        });
+      }
+      respond(id, { tools });
       return;
     }
     case "tools/call": {
@@ -107,9 +179,27 @@ function handle(req) {
       return;
     }
     case "resources/list": {
-      respond(id, {
-        resources: [{ uri: "test://hello", name: "hello", mimeType: "text/plain" }],
-      });
+      const resources = [{ uri: "test://hello", name: "hello", mimeType: "text/plain" }];
+      if (resourcesExpanded) {
+        resources.push({ uri: "test://world", name: "world", mimeType: "text/plain" });
+      }
+      respond(id, { resources });
+      return;
+    }
+    case "resources/subscribe": {
+      const uri = params?.uri;
+      if (typeof uri !== "string") {
+        respondError(id, -32602, "missing uri");
+        return;
+      }
+      subscribed.add(uri);
+      respond(id, {});
+      return;
+    }
+    case "resources/unsubscribe": {
+      const uri = params?.uri;
+      if (typeof uri === "string") subscribed.delete(uri);
+      respond(id, {});
       return;
     }
     case "resources/read": {
@@ -124,15 +214,17 @@ function handle(req) {
       return;
     }
     case "prompts/list": {
-      respond(id, {
-        prompts: [
-          {
-            name: "greet",
-            description: "Greeting template",
-            arguments: [{ name: "name", description: "Who to greet", required: true }],
-          },
-        ],
-      });
+      const prompts = [
+        {
+          name: "greet",
+          description: "Greeting template",
+          arguments: [{ name: "name", description: "Who to greet", required: true }],
+        },
+      ];
+      if (promptsExpanded) {
+        prompts.push({ name: "farewell", description: "Goodbye template", arguments: [] });
+      }
+      respond(id, { prompts });
       return;
     }
     case "prompts/get": {

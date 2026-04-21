@@ -51,6 +51,11 @@ import {
   buildCatalogDispatcher,
   type CatalogEventListener,
 } from "./catalog-dispatcher.js";
+import {
+  autoSubscribeKnownResources,
+  installCatalogRefresher,
+  serverSupportsSubscribe,
+} from "./catalog-refresh.js";
 
 const PROTOCOL_VERSION = "2025-06-18";
 const CLIENT_NAME = "a2e-shell";
@@ -436,6 +441,43 @@ export async function connectStdioMcpServer(
     prompts_count: prompts.size,
     protocol_version: initResult.protocolVersion,
   });
+
+  // --- list_changed refresher (RFC 004 phase 2) ---------------------------
+  installCatalogRefresher({
+    serverId: spec.id,
+    dispatcher,
+    tools,
+    resources,
+    prompts,
+    rpc: (method, params) => rpc(method, params),
+    canSubscribe: serverSupportsSubscribe(initResult),
+  });
+
+  // --- auto-subscribe (RFC 004 phase 2) -----------------------------------
+  if (spec.resources_subscribe && serverSupportsSubscribe(initResult) && resources.size > 0) {
+    void (async () => {
+      const result = await autoSubscribeKnownResources({
+        serverId: spec.id,
+        resources,
+        subscribe: async (uri: string) => {
+          try {
+            await rpc("resources/subscribe", { uri });
+            subscribedUris.add(uri);
+            return true;
+          } catch (e) {
+            if (isMethodNotFound(e)) return false;
+            throw e;
+          }
+        },
+      });
+      logger.info({
+        event: "mcp.subscribe.auto_complete",
+        server_id: spec.id,
+        subscribed: result.subscribed,
+        truncated: result.truncated,
+      });
+    })();
+  }
 
   // --- close ---------------------------------------------------------------
 
